@@ -27,8 +27,10 @@ adjust volume.
 > 想要使用小米蓝牙遥控器硬件做类似事情的人提供参考——这里的设备协议逆向、
 > 蓝牙语音解码、被系统丢弃按键的救回方案，全网目前没有现成的 Windows 实现。
 >
-> **交流意愿**：欢迎友好交流。提 Issue、发 PR、讨论改进方向都很欢迎，
-> 但请保持善意，不承诺及时回复，也不保证在任何环境都能工作。
+> **交流意愿**：这是我自己 vibe coding 出来的一个小玩具，分享出来纯粹是
+> 希望它记录的技术方案能帮到遇到同样问题的人。**大概率不会有后期维护**——
+> 如果哪里跑不通，README 的踩坑记录和 `docs/` 里的技术档案写得很细，
+> 建议直接把源码拿去自己改，不必等我。祝玩得开心。
 >
 > **Project status**: This is a vibe-coding project — built in a single day by
 > an AI agent working with its author. The code is rough; it is **not** a
@@ -41,9 +43,12 @@ adjust volume.
 > dropped by the Windows driver have no existing open-source Windows
 > implementation that we know of.
 >
-> **Community**: Friendly technical discussion is welcome — issues, PRs and
-> improvement ideas appreciated. Please be kind; no guarantee of timely
-> responses or that it works everywhere.
+> **Community**: This is a little toy I vibe-coded for myself, shared purely
+> in the hope that the documented solutions help someone hitting the same
+> problems. **It will most likely not be maintained.** If something breaks,
+> the pitfalls log in this README and the archive under `docs/` are quite
+> detailed — feel free to take the source and adapt it yourself rather than
+> waiting on me. Happy hacking.
 
 ---
 
@@ -54,7 +59,7 @@ adjust volume.
 - [快速开始](#快速开始)
 - [踩坑记录](#踩坑记录本文档最有价值的部分)
 - [已知限制](#已知限制)
-- [Roadmap](#roadmap欢迎-pr)
+- [Roadmap](#roadmap想折腾的方向)
 - [致谢与许可](#致谢与许可)
 
 ## English Contents
@@ -64,7 +69,7 @@ adjust volume.
 - [Quick Start](#quick-start)
 - [Pitfalls Log](#pitfalls-log-the-most-valuable-part-of-this-doc)
 - [Known Limitations](#known-limitations)
-- [Roadmap](#roadmap-prs-welcome)
+- [Roadmap](#roadmap-ideas-if-you-want-to-hack-on-it)
 - [Credits & License](#credits--license)
 
 ---
@@ -187,7 +192,7 @@ CUDA 模型加载时原生崩溃（access violation）。解法：转写放干�
 - 只在 RC003（固件 2671）+ 一台 RTX 4060 机器上验证过
 - 转写准确率：whisper medium 约 90%+，说"登录"偶尔变"灯露"
 
-## Roadmap（欢迎 PR）
+## Roadmap（想折腾的方向）
 
 - [ ] 开机自启 UAC 优化（计划任务以最高权限运行）
 - [ ] FunASR/SenseVoice 替换 whisper（中文 CER 约一半、快 12 倍）
@@ -346,7 +351,7 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 - Transcription accuracy: whisper medium ≈ 90%+; "登录" (login) occasionally
   becomes "灯露"
 
-## Roadmap (PRs welcome)
+## Roadmap (ideas if you want to hack on it)
 
 - [ ] Boot autostart without UAC prompt (scheduled task with highest privileges)
 - [ ] Replace whisper with FunASR/SenseVoice (half the CER, 12× faster for Chinese)
