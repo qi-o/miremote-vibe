@@ -202,14 +202,43 @@ CUDA 模型加载时原生崩溃（access violation）。解法：转写放干�
 
 ## 致谢与许可
 
-- 哑键拦截方案移植自 GPL-3.0 项目 [xxb26553663-star/remote-bridge-hub](https://github.com/xxb26553663-star/remote-bridge-hub)
-- ATVV 协议参考 [fanxeon/mi-ao](https://github.com/fanxeon/mi-ao) 的真机协议文档
-- UI 参考 [nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)
-- macOS 同类项目：[godarrenw/mi_remote_control](https://github.com/godarrenw/mi_remote_control)
+这个项目是站在许多先行者的肩膀上做出来的——没有下面这些项目的开源精神，
+它不可能在一天之内完成。在此郑重鸣谢：
 
-本项目代码采用 **MIT** 许可（见 [LICENSE](LICENSE)）。
-"Frida"、"VB-CABLE"、"微信输入法"、"小米"为各自所有者的商标/产品，
-本项目与它们无隶属关系。
+### 直接参考的项目
+
+- **[xxb26553663-star/remote-bridge-hub](https://github.com/xxb26553663-star/remote-bridge-hub)**（GPL-3.0）
+  返回/音量"哑键"的救回方案完全建立在它的真机逆向之上——Frida Gadget 注入
+  WUDFHost、IOCTL 过滤、usage 表、注入器结构均源自该项目。这是全项目技术
+  含量最高的部分，感谢原作者的开源分享。
+- **[fanxeon/mi-ao（米遥）](https://github.com/fanxeon/mi-ao)**
+  ATVV 语音协议（UUID、握手字节、opcode、ADPCM 帧格式）直接参考其真机
+  协议文档（docs/PROTOCOL.md），语音链路能一天打通全靠它铺路。
+- **[nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)**
+  Windows 端 UI 的参考（PySide6 方案），其文档对"返回键被 Windows 驱动丢弃"
+  的记录帮我们确认了问题根源。它同样致谢了 remote-bridge-hub——开源的接力。
+- **[godarrenw/mi_remote_control](https://github.com/godarrenw/mi_remote_control)**
+  macOS 同类项目，"ATVV 解码 → 虚拟声卡 → 输入法"的桥接思路源自它的启发。
+
+### 依赖的开源项目
+
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) ·
+[whisper](https://github.com/openai/whisper) ·
+[PySide6/Qt](https://www.qt.io) ·
+[Frida](https://frida.re) ·
+[PyInstaller](https://pyinstaller.org) ·
+[sounddevice/PortAudio](https://python-sounddevice.readthedocs.io) ·
+[winrt Python 绑定](https://github.com/pywinrt/pywinrt)
+
+### 许可声明
+
+- 本项目代码采用 **MIT** 许可（见 [LICENSE](LICENSE)）；
+  **例外**：`miremote/tapinject.py` 与 `miremote/backkey.py` 衍生自
+  GPL-3.0 项目 remote-bridge-hub，这两个文件以 **GPL-3.0** 提供。
+- "Frida"、"VB-CABLE"、"微信输入法/WeType"、"小米/Xiaomi"为各自所有者的
+  商标/产品，本项目与它们无隶属关系。
+
+如果这些项目帮到了你，也请去给它们一个 Star。
 
 ---
 
@@ -361,11 +390,46 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 
 ## Credits & License
 
-- Dead-key recovery ported from the GPL-3.0 project [xxb26553663-star/remote-bridge-hub](https://github.com/xxb26553663-star/remote-bridge-hub)
-- ATVV protocol references from [fanxeon/mi-ao](https://github.com/fanxeon/mi-ao)'s real-device protocol docs
-- UI inspired by [nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)
-- macOS siblings: [godarrenw/mi_remote_control](https://github.com/godarrenw/mi_remote_control)
+This project stands on the shoulders of those who shared their work before us —
+without their open-source spirit, a one-day build would have been impossible.
+Our sincere thanks:
 
-This project's code is released under the **MIT** license (see [LICENSE](LICENSE)).
-"Frida", "VB-CABLE", "WeType/微信输入法" and "Xiaomi/小米" are trademarks or
-products of their respective owners; this project is not affiliated with them.
+### Projects directly referenced
+
+- **[xxb26553663-star/remote-bridge-hub](https://github.com/xxb26553663-star/remote-bridge-hub)** (GPL-3.0)
+  The dead-key recovery (Back / Volume) is built entirely on their real-device
+  reverse engineering — the Frida Gadget injection into WUDFHost, IOCTL
+  filtering, usage table, and injector structure all originate from this
+  project. It is the most technically valuable part of this repo; many thanks
+  to the author for sharing it.
+- **[fanxeon/mi-ao](https://github.com/fanxeon/mi-ao)**
+  The ATVV voice protocol (UUIDs, handshake bytes, opcodes, ADPCM frame
+  format) directly follows their real-device protocol notes (docs/PROTOCOL.md).
+  The voice link only came together in a day because they paved the road.
+- **[nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)**
+  Reference for the Windows UI (PySide6 approach); their documentation of the
+  driver-dropped Back key confirmed our root cause. They too credit
+  remote-bridge-hub — open source as a relay race.
+- **[godarrenw/mi_remote_control](https://github.com/godarrenw/mi_remote_control)**
+  A macOS sibling that inspired the "ATVV decode → virtual audio device → IME"
+  bridging idea.
+
+### Open-source dependencies
+
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) ·
+[whisper](https://github.com/openai/whisper) ·
+[PySide6/Qt](https://www.qt.io) ·
+[Frida](https://frida.re) ·
+[PyInstaller](https://pyinstaller.org) ·
+[sounddevice/PortAudio](https://python-sounddevice.readthedocs.io) ·
+[pywinrt](https://github.com/pywinrt/pywinrt)
+
+### License notice
+
+- This project's code is released under the **MIT** license (see [LICENSE](LICENSE));
+  **exception**: `miremote/tapinject.py` and `miremote/backkey.py` derive from
+  the GPL-3.0 project remote-bridge-hub and are provided under **GPL-3.0**.
+- "Frida", "VB-CABLE", "WeType/微信输入法" and "Xiaomi/小米" are trademarks or
+  products of their respective owners; this project is not affiliated with them.
+
+If any of these projects helped you, please give them a Star too.

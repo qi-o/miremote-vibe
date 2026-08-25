@@ -1,3 +1,22 @@
+This project is dual-licensed at the file level:
+
+1. Unless stated otherwise, all files are licensed under the MIT license
+   (text below).
+
+2. EXCEPTION — the following files derive from the GPL-3.0 project
+   "remote-bridge-hub" (https://github.com/xxb26553663-star/remote-bridge-hub)
+   and are licensed under the GNU General Public License v3.0
+   (https://www.gnu.org/licenses/gpl-3.0.html):
+
+       miremote/tapinject.py
+       miremote/backkey.py
+
+   The dead-key recovery approach (Frida Gadget injection into WUDFHost,
+   IOCTL filtering, HID usage table, injector structure) originates from
+   that project. We thank its author for sharing this work.
+
+--------------------------------------------------------------------------
+
 MIT License
 
 Copyright (c) 2026 miremote-vibe contributors
