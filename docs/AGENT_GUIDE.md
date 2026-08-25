@@ -1,5 +1,13 @@
 # AGENT GUIDE：项目技术档案与改进指南
 
+> **English note**: This is the Chinese agent/engineer handoff guide — code
+> structure, hard-coded protocol facts (ATVV UUIDs, opcodes, HID usage table,
+> registry-based device discovery), the must-read pitfall list (§5), build/test
+> commands (§4), and a priority-ranked improvement roadmap (§6). Machine
+> translation of this file is usually good enough for the tables and code
+> blocks; read README.md (English section) first for context.
+
+
 > 本文档写给接手开发/改进此项目的 AI agent 或工程师。
 > 包含：项目现状、代码结构、硬编码技术事实、已知坑、构建方法、改进方向。
 > **改动前务必通读 §3 硬编码事实 和 §5 已知坑——每一条都是实测换来的。**
