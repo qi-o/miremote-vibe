@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+logs/
+*.wav
+last_utterance.wav
+voice.wav
+remote_check.png
+gui_preview*.png
+# Frida Gadget 二进制不入库（README 有下载说明）
+assets/frida-gadget-*.dll.xz
+# 本地环境
+.venv/
+*.log

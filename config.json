@@ -1,0 +1,26 @@
+{
+  "device": {
+    "vid": "2717",
+    "pid": "32B8",
+    "hid_tap": true,
+    "_说明": "小米蓝牙遥控器 2 Pro (RC003)。hid_tap=true 启用返回/音量哑键拦截（需 pip install frida，首次弹 UAC）"
+  },
+  "keys": {
+    "VK_LEFT":  { "label": "←",  "scan": "0x4B", "on_down": { "type": "none" } },
+    "VK_RIGHT": { "label": "→",  "scan": "0x4D", "on_down": { "type": "none" } },
+    "VK_UP":    { "label": "↑",  "scan": "0x48", "on_down": { "type": "none" } },
+    "VK_DOWN":  { "label": "↓",  "scan": "0x50", "on_down": { "type": "none" } },
+    "VK_RETURN":{ "label": "OK", "scan": "0x1C", "on_down": { "type": "none" } },
+    "VK_HOME":  { "label": "主页", "scan": "0x47", "on_down": { "type": "none" } },
+    "VK_APPS":  { "label": "菜单", "scan": "0x5D", "on_down": { "type": "none" } },
+    "VK_0xC0":  { "label": "TV", "scan": "0x29", "on_down": { "type": "none" } },
+    "VK_F5":    { "label": "语音", "scan": "0x3F", "on_down": { "type": "voice" } },
+    "VK_NONE":  { "label": "电源", "scan": "0x5E", "on_down": { "type": "none" } },
+    "TAP_BACK":       { "label": "返回→打断", "on_down": { "type": "tap", "key": "VK_ESCAPE" } },
+    "TAP_VOLUME_UP":  { "label": "音量+", "on_down": { "type": "volume", "delta": 1 } },
+    "TAP_VOLUME_DOWN":{ "label": "音量-", "on_down": { "type": "volume", "delta": -1 } },
+    "TAP_VOLUME_MUTE":{ "label": "静音",  "on_down": { "type": "volume", "delta": 0 } },
+    "_提示1": "VK_ 键来自 GUI 绑定；TAP_ 前缀是 WUDFHost 拦截到的哑键（返回/音量±/静音），动作在手改本文件",
+    "_提示2": "常用动作: {\"type\":\"keys\",\"combo\":[\"VK_SHIFT\",\"VK_TAB\"]} 切权限模式; {\"type\":\"focus_then_keys\",\"title_regex\":\"终端标题\",\"combo\":[...]} 聚焦终端再发键"
+  }
+}
