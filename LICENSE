@@ -11,10 +11,6 @@ This project is dual-licensed at the file level:
        miremote/tapinject.py
        miremote/backkey.py
 
-   The dead-key recovery approach (Frida Gadget injection into WUDFHost,
-   IOCTL filtering, HID usage table, injector structure) originates from
-   that project. We thank its author for sharing this work.
-
 --------------------------------------------------------------------------
 
 MIT License
