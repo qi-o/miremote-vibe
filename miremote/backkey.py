@@ -42,8 +42,11 @@ USAGE_NAMES = {
     0x0080: "volume_up",
     0x0081: "volume_down",
 }
-# 只转发 Windows 原生不转发的键（避免与 Raw Input 双触发）
-DEAD_USAGES = {0x00F1, 0x007F, 0x0080, 0x0081}
+# 只转发 Windows 原生不转发的键（避免与 Raw Input 双触发）。
+# power=0x66：HidOverGatt 收到报文但 VK 映射为 0（本机实测 VK_NONE），
+# 与返回/音量同样走救回通道；实测 RC003 实体没有静音键（0x7F 从未出现过，
+# 协议表里的幽灵键），保留在表中仅为兼容，不会触发。
+DEAD_USAGES = {0x00F1, 0x0066, 0x007F, 0x0080, 0x0081}
 
 TAP_PORT = int(os.environ.get("MIREMOTE_TAP_PORT", "30685"))
 

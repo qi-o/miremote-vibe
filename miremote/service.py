@@ -46,11 +46,13 @@ DEFAULT_CONFIG = {
         "VK_HOME": {"label": "主页", "on_down": {"type": "none"}},
         "VK_APPS": {"label": "菜单", "on_down": {"type": "none"}},
         "VK_0xC0": {"label": "TV", "on_down": {"type": "keys", "combo": ["VK_MENU", "VK_TAB"]}},
+        # 电源键（usage 0x66）：HidOverGatt 收到报文但 VK 映射为 0（VK_NONE），
+        # Raw Input 通道天然可用，无需注入。它也会出现在 backkey 的 9 字节报文里，
+        # 如需改走注入通道，在 service 的 TAP_KEYS 加 "power" 条目即可（勿双通道同开）
         "VK_NONE": {"label": "电源", "on_down": {"type": "none"}},
         "TAP_BACK": {"label": "返回", "on_down": {"type": "tap", "key": "VK_ESCAPE"}},
         "TAP_VOLUME_UP": {"label": "音量+", "on_down": {"type": "volume", "delta": 1}},
         "TAP_VOLUME_DOWN": {"label": "音量-", "on_down": {"type": "volume", "delta": -1}},
-        "TAP_VOLUME_MUTE": {"label": "静音", "on_down": {"type": "volume", "delta": 0}},
     },
     "hide_tray": False,   # 隐藏系统托盘图标（程序仍在后台，双击 exe 唤回）
 }
@@ -117,6 +119,8 @@ class MiRemoteService:
                 # 迁移：补齐后来新增的按键映射（老配置里没有的键）
                 for k, v in DEFAULT_CONFIG["keys"].items():
                     cfg.setdefault("keys", {}).setdefault(k, json.loads(json.dumps(v)))
+                # 迁移：移除幽灵静音键（RC003 实体没有这个键，usage 0x7F 从未出现）
+                cfg.setdefault("keys", {}).pop("TAP_VOLUME_MUTE", None)
                 # 迁移：修正 learn 阶段标错的 VK_HOME 标签
                 home = cfg.get("keys", {}).get("VK_HOME")
                 if isinstance(home, dict) and home.get("label") == "返回":
@@ -198,7 +202,7 @@ class MiRemoteService:
 
                 TAP_KEYS = {
                     "back": "TAP_BACK", "volume_up": "TAP_VOLUME_UP",
-                    "volume_down": "TAP_VOLUME_DOWN", "volume_mute": "TAP_VOLUME_MUTE",
+                    "volume_down": "TAP_VOLUME_DOWN",
                 }
 
                 def on_edge(name: str, is_down: bool):

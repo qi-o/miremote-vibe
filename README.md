@@ -81,7 +81,7 @@ adjust volume.
 | 功能 | 说明 |
 |---|---|
 | 按键捕获 | 方向/OK/主页/菜单/TV/电源/语音键，Raw Input 按设备过滤（不影响物理键盘） |
-| **哑键救回** | **返回/音量±/静音的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（macOS 项目也没有的能力） |
+| **哑键救回** | **返回/音量±的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（macOS 项目也没有的能力） |
 | 本地语音 | 按住说话→松手→ATVV 蓝牙协议解码→faster-whisper 本地转写→文字粘贴（全离线） |
 | 微信语音模式 | 声音桥接给微信输入法识别（自动去语气词、整理语句） |
 | Qt GUI | 按键映射可视化编辑（点遥控器图绑键）+ 语音模式切换 + 日志 + 系统托盘 |
@@ -180,6 +180,32 @@ CUDA 模型加载时原生崩溃（access violation）。解法：转写放干�
 - **exe 的自定义参数必须在 `__main__.main()` 登记**（`--silent` 被当未知命令
   打印帮助后秒退，造成开机自启"没反应"的假象）
 
+### 遥控器固件 ATVV 模块会卡死（软重启可修）
+
+症状：按键全部正常（SoftDevice 活着），但语音完全收不到音频帧，或只在松开语音键
+的瞬间收到几帧"尾巴"（0-8 帧 = 0~120ms）。日志特征是主机流打不开、固件反复报
+"物理流未释放"。**大概率由异常退出残留的悬挂麦克风会话引发**（进程被杀时没发
+MIC_CLOSE）。修复：**长按遥控器 TV 键重连**（电脑把它当键盘用，重连键是 TV 键，
+不是电视场景的主页+菜单）；顽固时在 Windows 蓝牙设置里删除设备重新配对。
+
+### 电源键的真实身份：VK_NONE（不是哑键）
+
+RC003 电源键（键盘页 usage 0x66）的报文 Windows 能收到，但 HidOverGatt 不为它
+映射任何虚拟键——Raw Input 里表现为 VK=0（VK_NONE）。所以电源键**天然可用且
+无需注入**，本项目把它按 `VK_NONE` 分发（见 `service.py` 默认配置）。
+
+### "静音键"是个幽灵
+
+协议 usage 表里有 0x7F（静音），早期版本也配置过它，但 RC003 实体上只有音量
++/- 两个侧键——0x7F 在真机上**从未出现过**。已从默认配置移除，避免误导后来者。
+
+### 与笔记本键盘的冲突边界（为什么本项目不受影响）
+
+RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相同，低层键盘
+钩子（SetWindowsHookEx）**无法区分事件来源**——基于钩子的方案必然互相干扰
+（实测过把笔记本 Enter 改写成空格的惨案）。本项目按键引擎走 **Raw Input 按设备
+过滤**（VID 2717/PID 32B8），笔记本键盘事件根本进不了分发，这是架构上免疫。
+
 ### 更多
 
 完整坑清单和调试方法论见 [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md) §5-§7，
@@ -197,13 +223,19 @@ CUDA 模型加载时原生崩溃（access violation）。解法：转写放干�
 - [ ] 开机自启 UAC 优化（计划任务以最高权限运行）
 - [ ] FunASR/SenseVoice 替换 whisper（中文 CER 约一半、快 12 倍）
 - [ ] 语音子进程常驻池（降低松手→出字延迟）
-- [ ] 低级键盘钩子按设备拦截透传键
+- [ ] 连续听写（松手不断流）：主机流 start_reason=0x00 + 每 8 秒 `MIC_EXTEND [0x0E, streamId]` 心跳 + generation/session 双重校验——完整参考实现见下面言灵项目的 `VibeMicAtvvCapture.cs`
 - [ ] 多遥控器/其他型号支持（需 learn 模式采集 usage 表）
 
 ## 致谢与许可
 
 ### 参考项目
 
+- **[richlearntodo-debug/vibe-flow（言灵 Vibe Flow）](https://github.com/richlearntodo-debug/vibe-flow)**（GPL-3.0）
+  同代际的 Windows 遥控器 vibe coding 工具（C#/.NET），功能更完整、有安装器和持续维护：
+  连续听写（主机流 + 8 秒 MIC_EXTEND 心跳，实测通过 15 分钟长听写）、微信/系统语音/
+  Typeless 等多转写客户端、默认麦克风三角色自动路由、七段自检。**本项目后期的很多
+  验证是在其源码协助下完成的**（连续听写协议细节、哑键失败原因分析），推荐想要
+  "开箱即用完整体验"的用户优先尝试言灵；两个项目对 RC003 的逆向结论互相印证。
 - **[xxb26553663-star/remote-bridge-hub](https://github.com/xxb26553663-star/remote-bridge-hub)**（GPL-3.0）
   哑键救回方案（Frida Gadget 注入 WUDFHost、IOCTL 过滤、usage 表、注入器结构）源自该项目。
 - **[fanxeon/mi-ao](https://github.com/fanxeon/mi-ao)**
@@ -240,7 +272,7 @@ CUDA 模型加载时原生崩溃（access violation）。解法：转写放干�
 | Feature | Notes |
 |---|---|
 | Button capture | D-pad / OK / Home / Menu / TV / Power / Voice via Raw Input, filtered by device (physical keyboard untouched) |
-| **Dead-key recovery** | **Back / Volume± / Mute HID reports are silently dropped by the Windows driver** — this project recovers them by injecting a Frida Gadget into WUDFHost (not even the macOS projects do this) |
+| **Dead-key recovery** | **Back / Volume± HID reports are silently dropped by the Windows driver** — this project recovers them by injecting a Frida Gadget into WUDFHost (not even the macOS projects do this) |
 | Local voice | Hold-to-talk → release → ATVV Bluetooth decode → faster-whisper local transcription → paste (fully offline) |
 | WeChat voice mode | Audio bridged to WeType IME recognition (auto-removes filler words, polishes sentences) |
 | Qt GUI | Visual key remapping (click the remote picture) + voice mode switch + log + system tray |
@@ -356,6 +388,40 @@ decoding). Related trap: never pass empty-string env vars
   unregistered `--silent` printed help and exited instantly, faking a broken
   boot autostart
 
+### The remote's ATVV firmware module can wedge (soft-recoverable)
+
+Symptoms: all buttons keep working (the SoftDevice is alive) but voice receives
+zero audio frames — or only a few "tail" frames (0–8 frames = 0–120 ms) at the
+moment you release the voice key. Log signature: host stream fails to open and
+the firmware keeps reporting "physical stream not released". Most likely caused
+by a leftover suspended mic session from an unclean exit (process killed without
+MIC_CLOSE). Fix: **long-press the remote's TV button to reconnect** (on a PC it
+is used as a keyboard, so the reconnect key is TV — not Home+Menu, which is the
+TV-scenario combo). For stubborn cases, remove and re-pair the device in
+Windows Bluetooth settings.
+
+### The power key's true identity: VK_NONE (not a dead key)
+
+The RC003 power key (keyboard-page usage 0x66) does reach Windows, but
+HidOverGatt maps it to no virtual key at all — it shows up in Raw Input as
+VK=0 (VK_NONE). So the power key works natively without any injection; this
+project dispatches it as `VK_NONE` (see `service.py` default config).
+
+### The "mute key" is a ghost
+
+The HID usage table lists 0x7F (mute), and early configs included it, but the
+RC003 hardware only has two volume rocker keys — 0x7F has never been observed
+on a real device. Removed from the default config to avoid misleading others.
+
+### Why this project never fights the laptop keyboard
+
+RC003's OK/Home/TV keys share exact VK+scancode with laptop Enter/Home/~, and a
+low-level keyboard hook (SetWindowsHookEx) **cannot tell which device an event
+came from** — hook-based designs inevitably cross-fire (we reproduced a laptop
+Enter turning into Space). This project's key engine runs on **Raw Input with
+per-device filtering** (VID 2717/PID 32B8): laptop keyboard events never enter
+the dispatch. Architectural immunity.
+
 ### More
 
 Full pitfall list and debugging methodology in
@@ -376,13 +442,26 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 - [ ] Boot autostart without UAC prompt (scheduled task with highest privileges)
 - [ ] Replace whisper with FunASR/SenseVoice (half the CER, 12× faster for Chinese)
 - [ ] Persistent transcription worker pool (lower release-to-text latency)
-- [ ] Per-device passthrough blocking via low-level keyboard hook
+- [ ] Continuous dictation (no stream break on release): host-owned stream with
+      start_reason=0x00 + 8-second `MIC_EXTEND [0x0E, streamId]` heartbeats +
+      generation/session double-checking — see vibe-flow's `VibeMicAtvvCapture.cs`
+      (linked below) for a complete reference implementation
 - [ ] Support more remotes (requires usage-table collection via learn mode)
 
 ## Credits & License
 
 ### Referenced projects
 
+- **[richlearntodo-debug/vibe-flow (言灵 Vibe Flow)](https://github.com/richlearntodo-debug/vibe-flow)** (GPL-3.0)
+  A same-generation Windows remote vibe-coding tool (C#/.NET) that is more
+  complete and actively maintained: continuous dictation (host stream + 8s
+  MIC_EXTEND heartbeats, regression-tested to 15 minutes), multiple dictation
+  clients (WeChat / Windows voice typing / Typeless), automatic default-mic
+  role routing, and a seven-part self-check. **Much of this project's later
+  verification was done with its source as reference** (continuous-dictation
+  protocol details, dead-key failure analysis). If you want a polished
+  out-of-the-box experience, try vibe-flow first; the two projects
+  cross-validate each other's RC003 reverse-engineering.
 - **[xxb26553663-star/remote-bridge-hub](https://github.com/xxb26553663-star/remote-bridge-hub)** (GPL-3.0)
   Source of the dead-key recovery approach (Frida Gadget injection into
   WUDFHost, IOCTL filtering, usage table, injector structure).
