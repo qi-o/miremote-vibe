@@ -118,7 +118,7 @@ pip install PySide6-Essentials faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu
 python -m miremote app
 ```
 
-蓝牙配对遥控器（长按主页+菜单键进入配对模式），启动守护即可。
+蓝牙配对遥控器（长按 TV 键进入配对模式；电脑上它是键盘设备，重连同样长按 TV 键），启动守护即可。
 详细步骤见 [docs/使用说明.md](docs/使用说明.md)。
 
 ### 打包 exe
