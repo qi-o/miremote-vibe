@@ -604,6 +604,7 @@ class VoiceDaemon:
     async def _main(self):
         self.loop = asyncio.get_running_loop()
         self._cmds = asyncio.Queue()
+        fail_streak = 0  # 连续连接失败计数（区分偶发 vs 系统性故障）
         while not self._stop.is_set():
             cli = AtvvClient(self.addr)
             try:
@@ -611,6 +612,7 @@ class VoiceDaemon:
                 resp = await cli.get_caps()
                 if not resp:
                     raise RuntimeError("GET_CAPS 无响应")
+                fail_streak = 0
                 self.log(f"语音引擎就绪 ({cli.parse_caps(resp).get('adpcm_16k') and '16kHz' or '?'})")
                 self._ready.set()
                 while not self._stop.is_set():
@@ -630,18 +632,31 @@ class VoiceDaemon:
                             # 短击热键 -> 播放 -> 再短击关闭
                             self._live_buffer = []
                             cli.on_audio_live = self._buffer_write
-                        # 等松手信号（遥控器 00 02）或 finish 命令
+                        # 链路 watchdog：MIC_OPEN 后遥控器必回包（mic active 状态），
+                        # 4 秒无任何事件 = 链路半死（本次故障形态），主动断开重连
+                        ev_base = len(cli.events)
+
+                        async def _watchdog():
+                            await asyncio.sleep(4)
+                            return (len(cli.events) == ev_base
+                                    and not cli.audio_stopped.is_set())
+
+                        # 等松手信号（遥控器 00 02）或 finish 命令或 watchdog
                         stop_wait = asyncio.create_task(cli.audio_stopped.wait())
                         cmd_wait = asyncio.create_task(self._cmds.get())
+                        dog = asyncio.create_task(_watchdog())
                         done, pending = await asyncio.wait(
-                            {stop_wait, cmd_wait},
+                            {stop_wait, cmd_wait, dog},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
+                        if dog in done and dog.result():
+                            raise RuntimeError(
+                                "链路无响应（MIC_OPEN 后 4 秒无任何回包），重连")
                     elif cmd == "finish":
                         pass  # 上面的 wait 已处理
                     if self._collecting:
                         self._collecting = False
-                        for t in ("stop_wait", "cmd_wait"):
+                        for t in ("stop_wait", "cmd_wait", "dog"):
                             task = locals().get(t)
                             if task and not task.done():
                                 task.cancel()
@@ -669,14 +684,33 @@ class VoiceDaemon:
                             self.log("(没有收到音频帧)")
             except Exception as e:
                 self._ready.clear()
+                fail_streak += 1
+                if "特征不全" in str(e) and fail_streak >= 3:
+                    self.log(
+                        f"语音服务异常已连续 {fail_streak} 次（ATVV 特征丢失）。"
+                        "这通常是遥控器固件或系统 GATT 缓存卡死——"
+                        "请长按遥控器【主页+菜单】复位，或删除蓝牙设备后重新配对。"
+                        "（后台继续每 5 秒重试）"
+                    )
+                    await self._teardown(cli)
+                    await asyncio.sleep(5)
+                    continue
+                if fail_streak >= 10:
+                    self.log(f"连接连续失败 {fail_streak} 次，降低重试频率到 15 秒")
+                    await self._teardown(cli)
+                    await asyncio.sleep(15)
+                    continue
                 self.log(f"语音连接断开/出错({type(e).__name__}: {e})，2 秒后重连…")
-                try:
-                    await cli.close()
-                    if cli.dev is not None:
-                        cli.dev.close()
-                except Exception:
-                    pass
+                await self._teardown(cli)
                 await asyncio.sleep(2)
+
+    async def _teardown(self, cli):
+        try:
+            await cli.close()
+            if cli.dev is not None:
+                cli.dev.close()
+        except Exception:
+            pass
 
     # ---- 线程安全的对外接口 ----
     def begin(self):
