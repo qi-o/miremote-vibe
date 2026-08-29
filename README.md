@@ -269,11 +269,13 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 - [ ] 开机自启 UAC 优化（计划任务以最高权限运行）
 - [ ] FunASR/SenseVoice 替换 whisper（中文 CER 约一半、快 12 倍）
 - [ ] 语音子进程常驻池（降低松手→出字延迟）
-- [x] ~~连续听写（松手不断流）~~ → **已尝试未攻克**（2026-08，两个 Agent
-      独立攻坚）：固件侧主机流（start_reason=0x00）在本机 2671 上无音频且与
-      物理流互斥；输入法侧"按住说话"热键被防误触拒绝。完整失败档案与 dormant
-      代码（`MIREMOTE_REALTIME_DEV`）在仓库内，欢迎新思路。协议参考仍推荐
-      言灵的 `VibeMicAtvvCapture.cs`
+- [x] ~~连续听写（松手不断流）~~ → **11 个版本攻坚后放弃，最终回退松手播放**
+      （2026-08，两个独立 AI Agent + 三个复盘 AI + 主开发共四轮）：固件侧
+      主机流无音频且与物理流互斥、60s 单段上限；输入法侧防误触/面板累积/
+      通信模式静音等闭源行为无法从系统外保证。**完整复盘（四层根因/全部
+      尝试时间线/方法论教训/可复用遗产）见
+      [docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md](docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md)**；
+      dormant 代码（`MIREMOTE_REALTIME_DEV`）与诊断探针在仓库内，欢迎新思路
 - [ ] 多遥控器/其他型号支持（需 learn 模式采集 usage 表）
 
 ## 致谢与许可
@@ -553,13 +555,17 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 - [ ] Boot autostart without UAC prompt (scheduled task with highest privileges)
 - [ ] Replace whisper with FunASR/SenseVoice (half the CER, 12× faster for Chinese)
 - [ ] Persistent transcription worker pool (lower release-to-text latency)
-- [x] ~~Continuous dictation (no stream break on release)~~ → **attempted,
-      unsolved** (2026-08, two independent agents): on this 2671 unit the
-      host-owned stream (start_reason=0x00) carries no audio and is mutually
-      exclusive with the physical stream; on the IME side the hold-to-talk
-      hotkey is blocked by anti-mistouch. Failure archive and dormant code
-      (`MIREMOTE_REALTIME_DEV`) are in the repo — new ideas welcome. For
-      protocol reference still see vibe-flow's `VibeMicAtvvCapture.cs`
+- [x] ~~Continuous dictation (no stream break on release)~~ → **attempted
+      across 11 builds, abandoned, rolled back to release-playback**
+      (2026-08, two independent AI agents + three reviewer AIs + the lead
+      developer): the host-owned stream carries no audio and is mutually
+      exclusive with the physical stream on this 2671 unit; the IME's
+      anti-mistouch, panel accumulation and communication-mode muting are
+      unverifiable from outside. **Full postmortem (root causes per layer,
+      complete attempt timeline, methodology lessons, surviving assets) in
+      [docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md](docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md)**
+      (Chinese). Dormant code (`MIREMOTE_REALTIME_DEV`) and diagnostic probes
+      are in the repo — new ideas welcome
 - [ ] Support more remotes (requires usage-table collection via learn mode)
 
 ## Credits & License
