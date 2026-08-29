@@ -17,11 +17,24 @@ from .keys import vk_name
 from .rawinput import RawInputEngine
 
 
+def realtime_dev_build() -> bool:
+    if _env_bool("MIREMOTE_REALTIME_DEV"):
+        return True
+    return bool(
+        getattr(sys, "frozen", False)
+        and any(
+            marker in Path(sys.executable).stem
+            for marker in ("实时实验版", "实时输入开发版")
+        )
+    )
+
+
 def app_data_dir() -> Path:
     """配置/日志/模型的用户目录（打包后 exe 目录可能只读）。"""
     if getattr(sys, "frozen", False):
         base = os.environ.get("APPDATA", str(Path.home()))
-        return Path(base) / "MiRemoteVibe"
+        name = "MiRemoteVibe-RealtimeDev" if realtime_dev_build() else "MiRemoteVibe"
+        return Path(base) / name
     return Path(__file__).resolve().parent.parent
 
 
@@ -29,13 +42,48 @@ def config_path() -> Path:
     return app_data_dir() / "config.json"
 
 
+def _env_bool(name: str):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_env_overrides(cfg: dict) -> dict:
+    if realtime_dev_build():
+        cfg["voice_mode"] = "wechat"
+        cfg["wechat_live"] = True
+        cfg["wechat_hotkey"] = ["VK_CONTROL", "VK_LWIN", "VK_SHIFT"]
+        cfg["hide_tray"] = False
+        cfg["voice_diagnostics"] = True
+    mode = os.environ.get("MIREMOTE_VOICE_MODE")
+    if mode in {"local", "wechat"}:
+        cfg["voice_mode"] = mode
+    live = _env_bool("MIREMOTE_WECHAT_LIVE")
+    if live is not None:
+        cfg["wechat_live"] = live
+    hide_tray = _env_bool("MIREMOTE_HIDE_TRAY")
+    if hide_tray is not None:
+        cfg["hide_tray"] = hide_tray
+    auto_start = _env_bool("MIREMOTE_AUTO_START_SERVICE")
+    if auto_start is not None:
+        cfg["auto_start_service"] = auto_start
+    return cfg
+
+
 DEFAULT_CONFIG = {
     "device": {"vid": "2717", "pid": "32B8", "hid_tap": True, "voice": True},
     "voice_mode": "local",      # "local"=本地 whisper 转写；"wechat"=桥接输入法
     "voice_model": "medium",
-    # 微信切换式语音热键（短击开启/结束持续语音）。语音键 F5 透传会干扰
-    # 按住式 Ctrl+Win 检测，故用 Ctrl+Win+Shift 切换式 + 松手后播放架构
-    "wechat_hotkey": ["VK_CONTROL", "VK_LWIN", "VK_SHIFT"],
+    # 微信输入法"按住说话"快捷键（2026-08-28 与用户 WeType 设置对齐：
+    # Ctrl+Alt+V，避开系统/输入法冲突组合；WeType 侧需在 语音输入 设置里
+    # 给"按住说话"配置同样组合）。注意 WeType 快捷键必须含修饰键。
+    "wechat_hotkey": ["VK_CONTROL", "VK_MENU", "VK_V"],
+    # 播放策略：False=松手后整段重放（v2，8-24 验证过、不依赖吞键钩子）；
+    # True=ATVV 驱动的实时实验模式（开发版强制开启；稳定版默认关闭）
+    "wechat_live": False,
+    "wechat_ready_delay": 0.45,   # 面板热键后等输入法就绪的秒数（丢了开头可调大）
+    "voice_diagnostics": False,   # 调试时覆盖保存最后一段 WAV/ADPCM/指标
     "keys": {
         "VK_UP": {"label": "↑", "on_down": {"type": "none"}},
         "VK_DOWN": {"label": "↓", "on_down": {"type": "none"}},
@@ -46,9 +94,6 @@ DEFAULT_CONFIG = {
         "VK_HOME": {"label": "主页", "on_down": {"type": "none"}},
         "VK_APPS": {"label": "菜单", "on_down": {"type": "none"}},
         "VK_0xC0": {"label": "TV", "on_down": {"type": "keys", "combo": ["VK_MENU", "VK_TAB"]}},
-        # 电源键（usage 0x66）：HidOverGatt 收到报文但 VK 映射为 0（VK_NONE），
-        # Raw Input 通道天然可用，无需注入。它也会出现在 backkey 的 9 字节报文里，
-        # 如需改走注入通道，在 service 的 TAP_KEYS 加 "power" 条目即可（勿双通道同开）
         "VK_NONE": {"label": "电源", "on_down": {"type": "none"}},
         "TAP_BACK": {"label": "返回", "on_down": {"type": "tap", "key": "VK_ESCAPE"}},
         "TAP_VOLUME_UP": {"label": "音量+", "on_down": {"type": "volume", "delta": 1}},
@@ -104,17 +149,22 @@ class MiRemoteService:
         self._engine: RawInputEngine | None = None
         self._voice = None
         self._tap = None
+        self._llhook = None
 
     # ---- 配置 ----
     def _load_config(self) -> dict:
         p = config_path()
+        if not p.exists() and realtime_dev_build():
+            stable = Path(os.environ.get("APPDATA", str(Path.home()))) / "MiRemoteVibe" / "config.json"
+            if stable.exists():
+                p = stable
         if p.exists():
             try:
                 cfg = json.loads(p.read_text(encoding="utf-8"))
                 for k, v in DEFAULT_CONFIG.items():
                     cfg.setdefault(k, v)
-                # 迁移：旧的按住式两键热键升级为切换式三键（F5 透传会干扰两键检测）
-                if cfg.get("wechat_hotkey") == ["VK_CONTROL", "VK_LWIN"]:
+                # 迁移：热键归一到 Ctrl+Win 两键按住式（旧三键切换式会触发两个录音）
+                if cfg.get("wechat_hotkey") != DEFAULT_CONFIG["wechat_hotkey"]:
                     cfg["wechat_hotkey"] = list(DEFAULT_CONFIG["wechat_hotkey"])
                 # 迁移：补齐后来新增的按键映射（老配置里没有的键）
                 for k, v in DEFAULT_CONFIG["keys"].items():
@@ -125,10 +175,32 @@ class MiRemoteService:
                 home = cfg.get("keys", {}).get("VK_HOME")
                 if isinstance(home, dict) and home.get("label") == "返回":
                     home["label"] = "主页"
-                return cfg
+                return _apply_env_overrides(cfg)
             except (json.JSONDecodeError, OSError):
                 pass
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        return _apply_env_overrides(json.loads(json.dumps(DEFAULT_CONFIG)))
+
+    def _start_f5_hook_if_needed(self, eng: RawInputEngine):
+        dev = self.config.get("device", {})
+        if not (
+            dev.get("voice", True)
+            and self.config.get("wechat_live", False)
+            and self._voice is not None
+            and self._voice.ready
+        ):
+            return
+        try:
+            from .llhook import F5SuppressHook
+            self._llhook = F5SuppressHook(
+                eng,
+                voice_probe=self._voice.atvv_recent,
+                on_voice=self._voice.note_remote_f5,
+                log=lambda m: self.on_log(f"[f5] {m}"),
+                eager_resolve=False,
+            )
+            self._llhook.start()
+        except Exception as e:
+            self.on_log(f"F5 吞键不可用: {e}")
 
     def save_config(self, cfg: dict | None = None):
         if cfg is not None:
@@ -181,12 +253,17 @@ class MiRemoteService:
                     model=self.config.get("voice_model", "medium"),
                     mode=mode,
                     wechat_hotkey=self.config.get("wechat_hotkey"),
+                    live=self.config.get("wechat_live", True),
+                    ready_delay=self.config.get("wechat_ready_delay", 0.45),
+                    diagnostics=self.config.get("voice_diagnostics", False),
+                    diagnostics_root=app_data_dir() / "diagnostics",
                 )
                 self._voice = vd
                 if vd.start():
                     if mode == "wechat":
-                        self.on_log("语音引擎就绪（微信输入法模式）：按住语音键说话，"
-                                    "声音桥接给输入法，松手出字")
+                        playback_mode = "实时模式" if self.config.get("wechat_live", False) else "松手播放模式"
+                        self.on_log(f"语音引擎就绪（微信输入法{playback_mode}）：按住语音键说话，"
+                                    "松手出字")
                     else:
                         self.on_log("语音引擎就绪（本地模式）：按住【语音键】说话，"
                                     "松手后文字打进焦点窗口")
@@ -194,6 +271,10 @@ class MiRemoteService:
                     self.on_log("语音设备暂未就绪，后台会自动重试；连接成功后即可按住语音键说话")
             except Exception as e:
                 self.on_log(f"语音引擎不可用: {e}")
+
+        # 2b) 实时模式需要吞掉 RC003 暴露出的 F5。必须等 VoiceDaemon
+        # 已创建后再启动，否则第一段会因为 voice_probe 为空被误判成笔记本 F5。
+        self._start_f5_hook_if_needed(eng)
 
         # 3) 哑键拦截
         if dev.get("hid_tap", True):
@@ -214,8 +295,11 @@ class MiRemoteService:
                         return
                     self._run_action(conf, conf.get("label", name), f"tap:{name}")
 
-                self._tap = BackKeyTap(on_edge=on_edge,
-                                       log=lambda m: self.on_log(f"[tap] {m}"))
+                self._tap = BackKeyTap(
+                    on_edge=on_edge,
+                    log=lambda m: self.on_log(f"[tap] {m}"),
+                    suppress_voice=False,
+                )
                 self._tap.start()
                 self.on_log("哑键拦截已启动（首次会弹 UAC 提权）")
             except Exception as e:
@@ -230,6 +314,12 @@ class MiRemoteService:
             self._emit_status()
 
     def _cleanup(self):
+        if self._llhook:
+            try:
+                self._llhook.stop()
+            except Exception:
+                pass
+            self._llhook = None
         if self._tap:
             try:
                 self._tap.stop()

@@ -11,7 +11,18 @@ faster_whisper_datas = collect_data_files(
 )
 
 import os
+
+# Codex Desktop 会把自身的 Poppler/libheif DLL 目录前置到 PATH。若直接在
+# 该环境打包，PyInstaller 会误收集其中的 ICU/VC 运行库并覆盖 Windows/Qt
+# 依赖，最终导致打包程序导入 PySide6.QtCore 失败。
+_codex_runtime_marker = os.path.normcase(os.path.join('.cache', 'codex-runtimes'))
+os.environ['PATH'] = os.pathsep.join(
+    entry for entry in os.environ.get('PATH', '').split(os.pathsep)
+    if _codex_runtime_marker not in os.path.normcase(entry)
+)
+
 _datas = [('assets/remote.jpg', 'assets')]
+_build_name = os.environ.get('MIREMOTE_BUILD_NAME', '小米遥控器')
 # Frida Gadget 压缩包：exe 里哑键拦截（返回/音量）的必需资产。
 # 仓库不含该二进制（约 7MB），下载后放 assets/ 即自动打包：
 # https://github.com/frida/frida/releases/download/17.15.3/frida-gadget-17.15.3-windows-x86_64.dll.xz
@@ -77,7 +88,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='小米遥控器',
+    name=_build_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -236,7 +236,7 @@ def cmd_run():
     eng.on_key = cb
     eng.start()
 
-    # 哑键拦截（返回/音量±/静音）：钩住 WUDFHost 取回被 Windows 丢弃的报文
+    # 哑键拦截（返回/音量±）：钩住 WUDFHost 取回被 Windows 丢弃的报文
     tap = None
     if dev.get("hid_tap", True):
         try:
@@ -244,7 +244,7 @@ def cmd_run():
 
             TAP_KEYS = {
                 "back": "TAP_BACK", "volume_up": "TAP_VOLUME_UP",
-                "volume_down": "TAP_VOLUME_DOWN", "volume_mute": "TAP_VOLUME_MUTE",
+                "volume_down": "TAP_VOLUME_DOWN",
             }
 
             def on_edge(name: str, is_down: bool):

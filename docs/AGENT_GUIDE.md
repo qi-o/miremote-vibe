@@ -25,7 +25,7 @@
 | 按键捕获（Raw Input 按 VID/PID 过滤） | ✅ |
 | 哑键救回（返回/音量±，Frida Gadget 注入 WUDFHost） | ✅ |
 | 本地语音（ATVV→ADPCM→whisper→粘贴） | ✅ |
-| 微信语音模式（切换式桥接 WeType+VB-CABLE） | ✅ |
+| 微信语音模式（松手播放桥接 WeType+VB-CABLE，Ctrl+Alt+V 按住式） | ✅ |
 | Qt GUI（映射编辑/语音切换/日志/遥控器热区图） | ✅ |
 | 单文件 exe（241MB PyInstaller） | ✅ |
 | 开机静默自启 + 打开即启动守护 | ✅ |
@@ -80,7 +80,9 @@ miremote/
 
 ### 微信模式（切换式架构）
 - WeType 浮窗进程=微信输入法（非微信聊天客户端）；其设置可切语音麦克风
-- 热键 Ctrl+Win+Shift 短击=切换持续语音；Ctrl+Win 按住式被 F5 透传干扰（勿改回）
+- 2026-08-29 起：热键=WeType「按住说话」**Ctrl+Alt+V**，程序按住式 down/up；
+  旧切换式 Ctrl+Win+Shift 已弃用。防误触约束不变：硬件键按住期间 WeType 拒绝热键，
+  实时（按下即出字）路线两日攻坚未果，见仓库 README「实时输入」节与桌面失败档案
 - CABLE 设备 44.1/48kHz，16k 音频需线性重采样（voice.py _wechat_playback）
 
 ### 运行环境

@@ -3,8 +3,13 @@
     "vid": "2717",
     "pid": "32B8",
     "hid_tap": true,
-    "_说明": "小米蓝牙遥控器 2 Pro (RC003)。hid_tap=true 启用返回/音量哑键拦截（需 pip install frida，首次弹 UAC）"
+    "_说明": "小米蓝牙遥控器 2 Pro (RC003)。hid_tap=true 启用返回/音量哑键拦截（tap4 协议，需 pip install frida，首次弹 UAC）"
   },
+  "voice_mode": "local",
+  "voice_model": "medium",
+  "wechat_live": false,
+  "wechat_hotkey": ["VK_CONTROL", "VK_MENU", "VK_V"],
+  "wechat_ready_delay": 0.45,
   "keys": {
     "VK_LEFT":  { "label": "←",  "scan": "0x4B", "on_down": { "type": "none" } },
     "VK_RIGHT": { "label": "→",  "scan": "0x4D", "on_down": { "type": "none" } },
@@ -19,8 +24,8 @@
     "TAP_BACK":       { "label": "返回→打断", "on_down": { "type": "tap", "key": "VK_ESCAPE" } },
     "TAP_VOLUME_UP":  { "label": "音量+", "on_down": { "type": "volume", "delta": 1 } },
     "TAP_VOLUME_DOWN":{ "label": "音量-", "on_down": { "type": "volume", "delta": -1 } },
-    "TAP_VOLUME_MUTE":{ "label": "静音",  "on_down": { "type": "volume", "delta": 0 } },
-    "_提示1": "VK_ 键来自 GUI 绑定；TAP_ 前缀是 WUDFHost 拦截到的哑键（返回/音量±/静音），动作在手改本文件",
-    "_提示2": "常用动作: {\"type\":\"keys\",\"combo\":[\"VK_SHIFT\",\"VK_TAB\"]} 切权限模式; {\"type\":\"focus_then_keys\",\"title_regex\":\"终端标题\",\"combo\":[...]} 聚焦终端再发键"
+    "_提示1": "VK_ 键来自 GUI 绑定；TAP_ 前缀是 WUDFHost 拦截到的哑键（返回/音量±，tap4 协议），动作在手改本文件。RC003 实体没有静音键（usage 0x7F 幽灵键），配置会被自动移除",
+    "_提示2": "常用动作: {\"type\":\"keys\",\"combo\":[\"VK_SHIFT\",\"VK_TAB\"]} 切权限模式; {\"type\":\"focus_then_keys\",\"title_regex\":\"终端标题\",\"combo\":[...] } 聚焦终端再发键",
+    "_提示3": "微信输入法桥接（voice_mode=wechat）：需 VB-CABLE，且在微信输入法设置里把语音麦克风设为 CABLE Output、\"按住说话\"快捷键设为 Ctrl+Alt+V"
   }
 }

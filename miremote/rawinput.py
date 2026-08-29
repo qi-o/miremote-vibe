@@ -12,6 +12,7 @@ import itertools
 import os
 import re
 import threading
+import time
 from ctypes import wintypes as wt
 from dataclasses import dataclass, field
 
@@ -152,6 +153,8 @@ class RawInputEngine:
     _thread_id: int = field(default=0, init=False, repr=False)
     _start_ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _start_error: Exception | None = field(default=None, init=False, repr=False)
+    # 最近一次遥控器各键键盘事件的时间（monotonic），供 LL 钩子判定 F5 来源
+    _remote_key_log: dict = field(default_factory=dict, init=False, repr=False)
 
     # ---- 设备路径缓存 / 遥控器判定 ----
     def _device_path(self, hdev) -> str:
@@ -232,6 +235,8 @@ class RawInputEngine:
                 device=path,
                 is_remote=remote,
             )
+            if remote:
+                self._remote_key_log[ev.vkey] = time.monotonic()
         elif raw.header.dwType == RIM_TYPEHID:
             hid = ctypes.cast(
                 ctypes.byref(raw, ctypes.sizeof(RAWINPUTHEADER)),
@@ -265,6 +270,16 @@ class RawInputEngine:
                 traceback.print_exc()
 
     # ---- 公共 API ----
+    def recent_remote_key(self, vkey: int, within_ms: float = 80.0) -> bool:
+        """最近 within_ms 毫秒内是否收到过遥控器上某键的键盘事件。
+
+        raw input 先于低层键盘钩子分发（输入路径 RIT -> Raw Input -> LL 钩子
+        -> 系统队列），因此 LL 钩子回调里查这个记录即可判定当前硬件按键的
+        来源设备（见 llhook.py）。记录是单调时钟时间戳，dict 赋值原子。
+        """
+        t = self._remote_key_log.get(vkey)
+        return t is not None and (time.monotonic() - t) * 1000.0 <= within_ms
+
     def start(self):
         self._wnd = self._create_window()
         devs = (

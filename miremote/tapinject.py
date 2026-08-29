@@ -38,18 +38,30 @@ GADGET_DLL_SHA256 = (
 TAP_PORT = int(os.environ.get("MIREMOTE_TAP_PORT", "30685"))
 DLL_BASENAME = "miremote-tap"
 
-# Gadget 内运行的钩子脚本：拦 BTHLE 读特征值的 IOCTL，9 字节输出经本地 socket 推回
+# Gadget 内运行的钩子脚本：拦 BTHLE 读特征值的 IOCTL，9 字节输出经本地 socket 推回。
+# 开发版可通过双向控制通道要求仅在 RC003 句柄上抹掉 F5 usage；断线时立即恢复放行。
 GADGET_JS = """
 const READ_CHARACTERISTIC_IOCTL = 0x80018483;
 const EXPECTED_OUTPUT_LENGTH = 9;
+const PROTOCOL_VERSION = 4;
+const SCRIPT_VERSION = "2026.08.29-tap4";
+const VOICE_USAGE = 0x003e;
+const RC003_TOKEN = "vid&012717_pid&32b8";
 const HEARTBEAT_INTERVAL_MS = 5000;
 const RECONNECT_DELAY_MS = 1000;
+const MAX_OBJECT_NAME_BYTES = 65536;
 
 let connection = null;
 let output = null;
+let connectionPending = false;
 let writeChain = Promise.resolve();
 let reconnectTimer = null;
 let hookInstalled = false;
+let suppressVoice = false;
+let voiceArmUntil = 0;
+let voiceChannel = null;
+let commandBuffer = "";
+const handleNames = new Map();
 
 function asciiBytes(text) {
   const result = [];
@@ -67,12 +79,29 @@ function hexOf(pointer, length) {
   return out;
 }
 
+function textOf(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return out;
+}
+
 function scheduleReconnect() {
-  if (reconnectTimer !== null) return;
+  if (output !== null || connectionPending || reconnectTimer !== null) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectToHub();
   }, RECONNECT_DELAY_MS);
+}
+
+function dropConnection(current) {
+  if (connection !== current) return;
+  suppressVoice = false;
+  voiceArmUntil = 0;
+  commandBuffer = "";
+  connection = null;
+  output = null;
+  scheduleReconnect();
 }
 
 function emit(payload) {
@@ -85,28 +114,173 @@ function emit(payload) {
   writeChain = writeChain
     .then(() => current.writeAll(asciiBytes(line)))
     .catch(() => {
-      if (output === current) {
-        output = null;
-        connection = null;
-        scheduleReconnect();
-      }
+      if (output === current) dropConnection(connection);
     });
 }
 
+function applyCommand(command) {
+  if (typeof command !== "object" || command === null) return;
+  if (typeof command.suppress_voice === "boolean") {
+    suppressVoice = command.suppress_voice;
+    if (!suppressVoice) voiceArmUntil = 0;
+    emit({
+      kind: "control_ack",
+      protocol: PROTOCOL_VERSION,
+      suppress_voice: suppressVoice,
+      channel_learned: voiceChannel !== null
+    });
+  }
+  if (suppressVoice && typeof command.arm_voice_ms === "number") {
+    const duration = Math.max(100, Math.min(2000, command.arm_voice_ms));
+    voiceArmUntil = Date.now() + duration;
+    emit({ kind: "voice_arm_ack", duration_ms: duration });
+  }
+}
+
+async function readCommands(current) {
+  try {
+    while (connection === current) {
+      const chunk = await current.input.read(4096);
+      if (chunk.byteLength === 0) break;
+      commandBuffer += textOf(chunk);
+      let newline = commandBuffer.indexOf("\\n");
+      while (newline !== -1) {
+        const line = commandBuffer.slice(0, newline).trim();
+        commandBuffer = commandBuffer.slice(newline + 1);
+        if (line.length > 0) {
+          try {
+            applyCommand(JSON.parse(line));
+          } catch (_e) {}
+        }
+        newline = commandBuffer.indexOf("\\n");
+      }
+    }
+  } catch (_e) {}
+  dropConnection(current);
+}
+
 async function connectToHub() {
-  if (output !== null) return;
+  if (output !== null || connectionPending) return;
+  connectionPending = true;
   try {
     const current = await Socket.connect({
       family: "ipv4", host: "127.0.0.1", port: %PORT%
     });
     connection = current;
     output = current.output;
-    emit({ kind: "ready", pid: Process.id, hook_installed: hookInstalled });
+    readCommands(current);
+    emit({
+      kind: "ready",
+      pid: Process.id,
+      hook_installed: hookInstalled,
+      protocol: PROTOCOL_VERSION,
+      script_version: SCRIPT_VERSION,
+      suppression_supported: true,
+      channel_learned: voiceChannel !== null
+    });
   } catch (_e) {
     connection = null;
     output = null;
-    scheduleReconnect();
+  } finally {
+    connectionPending = false;
+    if (output === null) scheduleReconnect();
   }
+}
+
+function makeObjectNameReader(ntdll) {
+  const address = ntdll.findExportByName("NtQueryObject");
+  if (address === null) return null;
+  const query = new NativeFunction(
+    address, "int", ["pointer", "uint", "pointer", "uint", "pointer"]
+  );
+  return function (handle) {
+    const returnLength = Memory.alloc(4);
+    returnLength.writeU32(0);
+    query(handle, 1, ptr(0), 0, returnLength);
+    const needed = returnLength.readU32();
+    if (needed < 16 || needed > MAX_OBJECT_NAME_BYTES) return "";
+    const info = Memory.alloc(needed);
+    returnLength.writeU32(0);
+    const status = query(handle, 1, info, needed, returnLength);
+    if (status < 0) return "";
+    const length = info.readU16();
+    const namePointer = info.add(Process.pointerSize === 8 ? 8 : 4).readPointer();
+    if (length === 0 || (length & 1) !== 0 || namePointer.isNull()) return "";
+    const used = Math.min(returnLength.readU32() || needed, needed);
+    if (
+      namePointer.compare(info) < 0 ||
+      namePointer.add(length).compare(info.add(used)) > 0
+    ) return "";
+    return namePointer.readUtf16String(length / 2);
+  };
+}
+
+function describeHandle(handle, readObjectName) {
+  const key = handle.toString();
+  if (handleNames.has(key)) return handleNames.get(key);
+  let name = "";
+  try {
+    if (readObjectName !== null) name = readObjectName(handle);
+  } catch (_e) {}
+  const matched = name.toLowerCase().indexOf(RC003_TOKEN) !== -1;
+  const description = { key: key, name: name, matched: matched };
+  handleNames.set(key, description);
+  emit({ kind: "handle_probe", handle: key, name: name, matched: matched });
+  return description;
+}
+
+function fingerprintOf(pointer, length) {
+  if (pointer.isNull() || length <= 0) return "";
+  const captured = Math.min(length, 96);
+  return String(length) + ":" + hexOf(pointer, captured);
+}
+
+function hasVoiceUsage(pointer, length) {
+  if (length !== EXPECTED_OUTPUT_LENGTH) return false;
+  const bytes = new Uint8Array(pointer.readByteArray(length));
+  if (bytes[0] !== 1 || bytes[1] !== 0 || bytes[2] !== 0) return false;
+  for (let offset = 3; offset < 9; offset += 2) {
+    if ((bytes[offset] | (bytes[offset + 1] << 8)) === VOICE_USAGE) return true;
+  }
+  return false;
+}
+
+function voiceChannelMatches(handleKey, fingerprint) {
+  if (voiceChannel === null || voiceChannel.handle !== handleKey) return false;
+  if (voiceChannel.fingerprint === "") return true;
+  return voiceChannel.fingerprint === fingerprint;
+}
+
+function learnVoiceChannel(description, fingerprint, reason) {
+  voiceChannel = {
+    handle: description.key,
+    name: description.name,
+    fingerprint: fingerprint
+  };
+  voiceArmUntil = 0;
+  emit({
+    kind: "voice_channel_bound",
+    handle: description.key,
+    name: description.name,
+    fingerprint: fingerprint,
+    reason: reason
+  });
+}
+
+function suppressVoiceUsage(pointer, length) {
+  if (!suppressVoice || length !== EXPECTED_OUTPUT_LENGTH) return false;
+  const bytes = new Uint8Array(pointer.readByteArray(length));
+  if (bytes[0] !== 1 || bytes[1] !== 0 || bytes[2] !== 0) return false;
+  let changed = false;
+  for (let offset = 3; offset < 9; offset += 2) {
+    const usage = bytes[offset] | (bytes[offset + 1] << 8);
+    if (usage === VOICE_USAGE) {
+      pointer.add(offset).writeU8(0);
+      pointer.add(offset + 1).writeU8(0);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function installHook() {
@@ -114,10 +288,14 @@ function installHook() {
   const ntdll = Process.findModuleByName("ntdll.dll");
   const target = ntdll ? ntdll.findExportByName("NtDeviceIoControlFile") : null;
   if (target === null) return;
+  const readObjectName = makeObjectNameReader(ntdll);
   Interceptor.attach(target, {
     onEnter(args) {
       this.capture = args[5].toUInt32() === READ_CHARACTERISTIC_IOCTL;
       if (this.capture) {
+        this.fileHandle = args[0];
+        this.inputLength = args[7].toUInt32();
+        this.inputFingerprint = fingerprintOf(args[6], this.inputLength);
         this.output = args[8];
         this.outputLength = args[9].toUInt32();
       }
@@ -126,17 +304,66 @@ function installHook() {
       if (!this.capture || retval.toUInt32() !== 0 || this.output.isNull()) return;
       try {
         if (this.outputLength === EXPECTED_OUTPUT_LENGTH) {
-          emit({ kind: "gatt_read", raw: hexOf(this.output, this.outputLength) });
+          const raw = hexOf(this.output, this.outputLength);
+          const description = describeHandle(this.fileHandle, readObjectName);
+          const containsVoice = hasVoiceUsage(this.output, this.outputLength);
+          let channelMatch = description.matched || voiceChannelMatches(
+            description.key, this.inputFingerprint
+          );
+          if (
+            suppressVoice && containsVoice && !channelMatch &&
+            (voiceChannel === null || Date.now() <= voiceArmUntil)
+          ) {
+            learnVoiceChannel(
+              description,
+              this.inputFingerprint,
+              voiceChannel === null ? "first_voice_report" : "atvv_rearm"
+            );
+            channelMatch = true;
+          }
+          let suppressed = false;
+          if (channelMatch) {
+            suppressed = suppressVoiceUsage(this.output, this.outputLength);
+          }
+          emit({
+            kind: "gatt_read",
+            raw: raw,
+            suppressed_voice: suppressed,
+            handle: description.key,
+            fingerprint: this.inputFingerprint,
+            channel_match: channelMatch
+          });
         }
       } catch (_e) {}
     }
   });
+  const closeTarget = ntdll.findExportByName("NtClose");
+  if (closeTarget !== null) {
+    Interceptor.attach(closeTarget, {
+      onEnter(args) {
+        const key = args[0].toString();
+        handleNames.delete(key);
+        if (voiceChannel !== null && voiceChannel.handle === key) {
+          const lost = voiceChannel;
+          voiceChannel = null;
+          emit({ kind: "voice_channel_lost", handle: key, name: lost.name });
+        }
+      }
+    });
+  }
   hookInstalled = true;
 }
 
 setInterval(() => {
   if (output === null) scheduleReconnect();
-  else emit({ kind: "heartbeat", pid: Process.id });
+  else emit({
+    kind: "heartbeat",
+    pid: Process.id,
+    protocol: PROTOCOL_VERSION,
+    script_version: SCRIPT_VERSION,
+    suppress_voice: suppressVoice,
+    channel_learned: voiceChannel !== null
+  });
 }, HEARTBEAT_INTERVAL_MS);
 
 installHook();
@@ -166,7 +393,7 @@ def gadget_config_text() -> str:
             "interaction": {
                 "type": "script",
                 "path": f"{DLL_BASENAME}.js",
-                "on_change": "ignore",
+                "on_change": "reload",
             },
             "runtime": "qjs",
             "teardown": "minimal",
@@ -212,6 +439,85 @@ def prepare_runtime(log=print) -> Path:
             os.replace(tmp, p)
     log(f"运行时就绪: {dll_path}")
     return dll_path
+
+
+def is_wudfhost_process(pid: int) -> bool:
+    """只接受仍存活且进程名精确为 WUDFHost.exe 的目标。"""
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32")
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    k32.Process32FirstW.argtypes = (ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W))
+    k32.Process32NextW.argtypes = (ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W))
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    snapshot = k32.CreateToolhelp32Snapshot(2, 0)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return False
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    try:
+        if not k32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return False
+        while True:
+            if entry.th32ProcessID == pid:
+                return entry.szExeFile.casefold() == "wudfhost.exe"
+            if not k32.Process32NextW(snapshot, ctypes.byref(entry)):
+                return False
+    finally:
+        k32.CloseHandle(snapshot)
+
+
+def restart_host_and_inject(pid: int, dll_path: Path, log=print) -> int:
+    """结束已验证的 RC003 宿主，等待系统重建后注入新版 Gadget。"""
+    try:
+        from .backkey import find_rc003_host_pid
+    except ImportError:
+        from backkey import find_rc003_host_pid
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.TerminateProcess.argtypes = (ctypes.c_void_p, wintypes.UINT)
+    k32.TerminateProcess.restype = wintypes.BOOL
+    k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, wintypes.DWORD)
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    process = k32.OpenProcess(0x0001 | 0x00100000, False, pid)
+    if not process:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not k32.TerminateProcess(process, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        k32.WaitForSingleObject(process, 10_000)
+    finally:
+        k32.CloseHandle(process)
+    log(f"旧 Gadget 宿主已结束 pid={pid}，等待 RC003 宿主重建")
+
+    import time
+    deadline = time.monotonic() + 25.0
+    new_pid = None
+    while time.monotonic() < deadline:
+        candidate = find_rc003_host_pid()
+        if candidate and candidate != pid and is_wudfhost_process(candidate):
+            new_pid = candidate
+            break
+        time.sleep(0.25)
+    if new_pid is None:
+        raise TimeoutError("RC003 WUDFHost 未在 25 秒内重建")
+    log(f"RC003 新宿主 pid={new_pid}，注入最新版 Gadget")
+    inject_library(new_pid, dll_path, log=log)
+    return new_pid
 
 
 def inject_library(pid: int, dll_path: Path, log=print) -> None:
@@ -293,7 +599,7 @@ def inject_library(pid: int, dll_path: Path, log=print) -> None:
         k32.CloseHandle(process)
 
 
-def run_inject(pid: int, log=print) -> int:
+def run_inject(pid: int, log=print, refresh: bool = False) -> int:
     """提权入口：护栏校验 -> 布置运行时 -> 注入。"""
     try:
         from .backkey import enable_debug_privilege, find_rc003_host_pid
@@ -310,37 +616,7 @@ def run_inject(pid: int, log=print) -> int:
         log(f"目标已变化: 注册表={expected} 请求={pid}，拒绝注入")
         return 1
 
-    # 只允许注入 wudfhost.exe（用 toolhelp 快照校验进程名）
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
-            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260),
-        ]
-
-    k32 = ctypes.WinDLL("kernel32")
-    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-    k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
-    k32.Process32FirstW.argtypes = (ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W))
-    k32.Process32NextW.argtypes = (ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W))
-    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
-
-    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
-    entry = PROCESSENTRY32W()
-    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-    name_ok = False
-    if k32.Process32FirstW(snap, ctypes.byref(entry)):
-        while True:
-            if entry.th32ProcessID == pid:
-                name_ok = entry.szExeFile.casefold() == "wudfhost.exe"
-                break
-            if not k32.Process32NextW(snap, ctypes.byref(entry)):
-                break
-    k32.CloseHandle(snap)
-    if not name_ok:
+    if not is_wudfhost_process(pid):
         log(f"目标进程不是 wudfhost.exe，拒绝注入 (pid={pid})")
         return 1
 
@@ -349,7 +625,10 @@ def run_inject(pid: int, log=print) -> int:
     if sha256_file(dll) != GADGET_DLL_SHA256:
         log("DLL 哈希在注入前发生变化，中止")
         return 1
-    inject_library(pid, dll, log=log)
+    if refresh:
+        restart_host_and_inject(pid, dll, log=log)
+    else:
+        inject_library(pid, dll, log=log)
     return 0
 
 
@@ -369,10 +648,11 @@ def cli(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(description="RC003 Gadget 注入器（需管理员）")
     ap.add_argument("--inject", action="store_true")
+    ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--pid", type=int, required=True)
     args = ap.parse_args(argv)
     try:
-        rc = run_inject(args.pid, log=_log)
+        rc = run_inject(args.pid, log=_log, refresh=args.refresh)
     except Exception:
         import traceback
         _log("注入异常:\n" + traceback.format_exc())

@@ -20,7 +20,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import actions
 from .remote_widget import RemoteWidget, KEY_RECTS
-from .service import MiRemoteService, action_summary
+from .service import MiRemoteService, action_summary, realtime_dev_build
 
 # ---- 深色主题调色板 ----
 BG = "#0d1117"
@@ -37,14 +37,61 @@ YELLOW = "#e8bd6a"
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_SINGLE_INSTANCE_MUTEX = "Local\\MiRemoteVibe.Gui"
+_REALTIME_DEV = realtime_dev_build()
+_WINDOW_TITLE = "小米遥控器 · 实时实验版" if _REALTIME_DEV else "小米遥控器 · 控制台"
+_SINGLE_INSTANCE_MUTEX = (
+    "Local\\MiRemoteVibe.RealtimeDev.Gui" if _REALTIME_DEV
+    else "Local\\MiRemoteVibe.Gui"
+)
 # 二次启动的唤回信号文件（第一实例监听其所在目录，第二实例创建它）
 import tempfile as _tempfile
-_SHOW_FLAG = str(Path(_tempfile.gettempdir()).resolve() / "miremote_show.flag")
+_SHOW_FLAG = str(
+    Path(_tempfile.gettempdir()).resolve()
+    / ("miremote_realtime_dev_show.flag" if _REALTIME_DEV else "miremote_show.flag")
+)
 
 # 开机自启注册表（当前用户，无需管理员）
 _BOOT_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_BOOT_RUN_NAME = "MiRemoteVibe"
+_BOOT_RUN_NAME = "MiRemoteVibe-RealtimeDev" if _REALTIME_DEV else "MiRemoteVibe"
+
+
+def _show_existing_window_native() -> bool:
+    """二次启动时直接唤回第一实例窗口，文件信号只作 Qt 侧补充。"""
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    get_text = user32.GetWindowTextW
+    get_text.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    get_text.restype = ctypes.c_int
+    show_window = user32.ShowWindow
+    show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    show_window.restype = ctypes.c_bool
+    bring_to_top = user32.BringWindowToTop
+    bring_to_top.argtypes = [ctypes.c_void_p]
+    bring_to_top.restype = ctypes.c_bool
+    set_foreground = user32.SetForegroundWindow
+    set_foreground.argtypes = [ctypes.c_void_p]
+    set_foreground.restype = ctypes.c_bool
+    found = []
+
+    @enum_proc
+    def callback(hwnd, _lparam):
+        title = ctypes.create_unicode_buffer(128)
+        get_text(hwnd, title, len(title))
+        if title.value == _WINDOW_TITLE:
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(callback, None)
+    if not found:
+        return False
+    hwnd = found[0]
+    show_window(hwnd, 9)  # SW_RESTORE，同时显示隐藏窗口
+    bring_to_top(hwnd)
+    set_foreground(hwnd)
+    return True
 
 
 def _boot_launch_command() -> str:
@@ -118,7 +165,6 @@ PRESETS: list[tuple[str, dict]] = [
     ("语音（按住说话）", {"type": "voice"}),
     ("音量+", {"type": "volume", "delta": 1}),
     ("音量-", {"type": "volume", "delta": -1}),
-    ("静音", {"type": "volume", "delta": 0}),
     ("Esc 打断", {"type": "tap", "key": "VK_ESCAPE"}),
     ("回车 Enter", {"type": "tap", "key": "VK_RETURN"}),
     ("退格 Backspace", {"type": "tap", "key": "VK_BACK"}),
@@ -207,7 +253,7 @@ def _css() -> str:
 class MiRemoteWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("小米遥控器 · 控制台")
+        self.setWindowTitle(_WINDOW_TITLE)
         self.resize(1080, 720)
         self.setMinimumSize(900, 620)
         self.setStyleSheet(_css())
@@ -250,9 +296,15 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
             os.remove(_SHOW_FLAG)
         except OSError:
             pass
-        self.show()
+        self.showNormal()
         self.raise_()
         self.activateWindow()
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.requestActivate()
+        # Qt 6 的隐藏窗口在部分 Windows/PyInstaller 组合中 show() 后
+        # native HWND 仍保持不可见；补一次 Win32 SW_RESTORE。
+        _show_existing_window_native()
 
     def _build(self):
         central = QtWidgets.QWidget()
@@ -630,6 +682,16 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self.mode_box.currentIndexChanged.connect(self._on_mode_change)
         gl.addRow("模式:", self.mode_box)
 
+        self.live_box = QtWidgets.QCheckBox("实时输入（实验）")
+        self.live_box.setChecked(bool(self.service.config.get("wechat_live", False)))
+        self.live_box.setEnabled(
+            self.service.config.get("voice_mode") == "wechat" and not realtime_dev_build()
+        )
+        if realtime_dev_build():
+            self.live_box.setToolTip("实时实验版固定开启；稳定版仍使用松手播放")
+        self.live_box.toggled.connect(self._on_live_change)
+        gl.addRow("微信策略:", self.live_box)
+
         self.model_box = QtWidgets.QComboBox()
         self.model_box.addItems(["medium", "small", "base", "tiny"])
         m = self.service.config.get("voice_model", "medium")
@@ -727,14 +789,30 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
     def _voice_desc(self) -> str:
         mode = self.service.config.get("voice_mode")
         if mode == "wechat":
+            if self.service.config.get("wechat_live", False):
+                return (
+                    "微信实时实验模式：按下后立即打开 WeType 并实时送音，松手后排空尾音并出字。"
+                    "任一实时门禁失败会自动回退为松手播放。"
+                )
             return "微信语音模式：按住语音键说完松手，声音交给微信识别（自动去语气词、整理语句）。比本地模式多等几秒。"
         return "本地 whisper 转写：按住语音键说话，松手出字。模型越大越准、越慢。"
 
     def _on_mode_change(self):
         self.service.config["voice_mode"] = self.mode_box.currentData()
+        if hasattr(self, "live_box"):
+            self.live_box.setEnabled(
+                self.mode_box.currentData() == "wechat" and not realtime_dev_build()
+            )
         self.service.save_config()
         self.voice_desc.setText(self._voice_desc())
         self._append_log(f"语音模式已切换为 {self.mode_box.currentData()}（需重启守护）")
+
+    def _on_live_change(self, checked: bool):
+        self.service.config["wechat_live"] = bool(checked)
+        self.service.save_config()
+        self.voice_desc.setText(self._voice_desc())
+        strategy = "实时实验" if checked else "松手播放"
+        self._append_log(f"微信语音策略已切换为 {strategy}（需重启守护）")
 
     def _on_model_change(self):
         self.service.config["voice_model"] = self.model_box.currentText()
@@ -1021,13 +1099,13 @@ def main():
     if mutex is None:
         # 已有实例在跑：写唤回信号文件，第一实例的轮询定时器
         # 会自己 show/raise（Qt 亲自显示才正确重绘；外部 ShowWindow 会导致空白窗口）
-        import tempfile
-        flag = Path(tempfile.gettempdir()).resolve() / "miremote_show.flag"
+        flag = Path(_SHOW_FLAG)
         try:
             if ".." not in str(flag):
                 flag.write_text("show", encoding="utf-8")
         except OSError:
             pass
+        _show_existing_window_native()
         return
     app.aboutToQuit.connect(lambda: mutex[0](mutex[1]))
     app.setQuitOnLastWindowClosed(False)  # 关窗不退出，靠托盘

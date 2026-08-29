@@ -20,6 +20,7 @@ import argparse
 import ctypes
 import json
 import os
+import select
 import socket
 import threading
 import time
@@ -42,11 +43,11 @@ USAGE_NAMES = {
     0x0080: "volume_up",
     0x0081: "volume_down",
 }
-# 只转发 Windows 原生不转发的键（避免与 Raw Input 双触发）。
-# power=0x66：HidOverGatt 收到报文但 VK 映射为 0（本机实测 VK_NONE），
-# 与返回/音量同样走救回通道；实测 RC003 实体没有静音键（0x7F 从未出现过，
-# 协议表里的幽灵键），保留在表中仅为兼容，不会触发。
-DEAD_USAGES = {0x00F1, 0x0066, 0x007F, 0x0080, 0x0081}
+# 只转发 Windows 原生不转发的键（避免与 Raw Input 双触发）
+DEAD_USAGES = {0x00F1, 0x007F, 0x0080, 0x0081}
+VOICE_USAGE = 0x003E
+GADGET_PROTOCOL_VERSION = 4
+GADGET_SCRIPT_VERSION = "2026.08.29-tap4"
 
 TAP_PORT = int(os.environ.get("MIREMOTE_TAP_PORT", "30685"))
 
@@ -158,6 +159,19 @@ def decode_tap_report(data: bytes) -> set[int]:
         int.from_bytes(data[k:k + 2], "little") for k in range(3, 9, 2)
     }
     return usages - {0}
+
+
+def suppress_voice_usage_report(data: bytes, enabled: bool = True) -> tuple[bytes, bool]:
+    """镜像 Gadget 的 9 字节变换契约；只清 F5 槽，其余 usage 原样保留。"""
+    if not enabled or len(data) != 9 or data[:3] != b"\x01\x00\x00":
+        return data, False
+    output = bytearray(data)
+    changed = False
+    for offset in range(3, 9, 2):
+        if int.from_bytes(output[offset:offset + 2], "little") == VOICE_USAGE:
+            output[offset:offset + 2] = b"\x00\x00"
+            changed = True
+    return bytes(output), changed
 
 
 def enable_debug_privilege() -> None:
@@ -409,26 +423,111 @@ def run_helper(pid: int, port: int = TAP_PORT) -> int:
 class BackKeyTap:
     """守护侧：拉起提权 helper + 本地消费报文 -> 按键边沿回调。"""
 
-    def __init__(self, on_edge, log=print, auto_inject: bool = True):
+    def __init__(self, on_edge, log=print, auto_inject: bool = True,
+                 suppress_voice: bool = False, on_suppression_state=None):
         """on_edge(name: str, is_down: bool)；name 见 USAGE_NAMES。"""
         self.on_edge = on_edge
         self.log = log
         self.auto_inject = auto_inject
+        self.suppress_voice = suppress_voice
+        self.on_suppression_state = on_suppression_state
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self._active: set[int] = set()
         self._lock = threading.Lock()
         self._helper_launched_pid: int | None = None
+        self._client: socket.socket | None = None
+        self._refresh_attempted: set[int] = set()
+        self._refreshed_host_pid: int | None = None
+        self._suppression_ack = False
+        self._control_ack = False
+        self._voice_report_logged = False
+        self._voice_channel_bound = False
+
+    def _set_suppression_ack(self, ready: bool):
+        ready = bool(ready and self.suppress_voice)
+        if self._suppression_ack == ready:
+            return
+        self._suppression_ack = ready
+        if self.on_suppression_state is not None:
+            try:
+                self.on_suppression_state(ready)
+            except Exception as exc:
+                self.log(f"HID 抑制状态回调失败: {exc}")
 
     def _handle_line(self, message: dict):
         kind = message.get("kind")
+        if kind == "ready":
+            protocol = message.get("protocol")
+            script_version = message.get("script_version")
+            supported = message.get("suppression_supported") is True
+            if (
+                protocol != GADGET_PROTOCOL_VERSION
+                or script_version != GADGET_SCRIPT_VERSION
+                or (self.suppress_voice and not supported)
+            ):
+                self.log("检测到旧版 Gadget；将刷新 RC003 宿主以恢复稳定的哑键通道")
+                return "refresh"
+            self.log(
+                f"Gadget 协议 v{protocol} 已确认 "
+                f"(script={script_version})"
+            )
+            return None
+        if kind == "control_ack":
+            was_accepted = self._control_ack
+            accepted = (
+                message.get("protocol") == GADGET_PROTOCOL_VERSION
+                and message.get("suppress_voice") is self.suppress_voice
+            )
+            self._control_ack = accepted
+            if accepted and not was_accepted:
+                self.log("哑键通道控制握手已确认")
+            if accepted and self.suppress_voice and not self._suppression_ack:
+                self.log(
+                    f"HID 级语音键抑制已确认（协议 v{GADGET_PROTOCOL_VERSION}，断线自动放行）"
+                )
+                self._set_suppression_ack(True)
+            return None
+        if kind == "voice_channel_bound":
+            self._voice_channel_bound = True
+            fingerprint = str(message.get("fingerprint") or "")
+            preview = fingerprint[:48] + ("…" if len(fingerprint) > 48 else "")
+            self.log(
+                "已通过首个语音报告锁定 RC003 HID 通道 "
+                f"(handle={message.get('handle')}, input={preview or 'empty'}, "
+                f"reason={message.get('reason')})"
+            )
+            return None
+        if kind == "voice_channel_lost":
+            self._voice_channel_bound = False
+            self._voice_report_logged = False
+            self.log("RC003 HID 通道句柄已关闭；下一次语音报告将自动重新学习")
+            return None
+        if kind == "handle_probe":
+            if not self.suppress_voice:
+                return None
+            if message.get("matched") is True:
+                self.log("已锁定 RC003 HID 句柄，其他蓝牙 HID 不受影响")
+            elif not message.get("name"):
+                self.log("HID 句柄名称不可用；安全起见保持放行")
+            else:
+                self.log(f"忽略非 RC003 HID 句柄: {message.get('name')}")
+            return None
         if kind == "gatt_read":
             raw = message.get("raw", "")
             try:
                 data = bytes.fromhex(raw)
             except (TypeError, ValueError):
                 return
-            usages = decode_tap_report(data) & DEAD_USAGES
+            all_usages = decode_tap_report(data)
+            if VOICE_USAGE in all_usages and not self._voice_report_logged:
+                self._voice_report_logged = True
+                suppressed = message.get("suppressed_voice") is True
+                self.log(
+                    f"语音键 HID 报告已确认: {raw} "
+                    f"({'已抑制' if suppressed else '未抑制'})"
+                )
+            usages = all_usages & DEAD_USAGES
             with self._lock:
                 prev = set(self._active)
                 if usages == prev:
@@ -440,7 +539,7 @@ class BackKeyTap:
             for u in sorted(released):
                 self.on_edge(USAGE_NAMES.get(u, f"usage_0x{u:04X}"), False)
 
-    def _launch_helper(self, pid: int) -> bool:
+    def _launch_helper(self, pid: int, refresh: bool = False) -> bool:
         import sys
         # 提权会丢工作目录；注入器校验哈希后把 Gadget DLL 装进 WUDFHost 即退出，
         # Gadget 会主动连回本进程的 30685 端口推送按键报文。
@@ -454,18 +553,46 @@ class BackKeyTap:
         if frozen:
             # 打包后没有独立 python/脚本：exe 自调用（launcher 会转发 --inject）
             exe = str(Path(sys.executable))
-            params = f'--inject --pid {pid}'
+            params = f"--inject {'--refresh ' if refresh else ''}--pid {pid}"
         else:
             script = Path(__file__).resolve().with_name("tapinject.py")
             exe = str(Path(sys.executable))
-            params = f'"{script}" --inject --pid {pid}'
+            params = f'"{script}" --inject {'--refresh ' if refresh else ''}--pid {pid}'
         result = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", exe, params, str(archive.parent), 0
         )
         ok = int(result) > 32
         self._helper_launched_pid = pid if ok else None
-        self.log(f"注入器提权启动 {'成功' if ok else '被拒绝'} (pid={pid})")
+        operation = "刷新器" if refresh else "注入器"
+        self.log(f"{operation}提权启动 {'成功' if ok else '被拒绝'} (pid={pid})")
         return ok
+
+    def _send_control(self, client: socket.socket, enabled: bool | None = None) -> bool:
+        value = self.suppress_voice if enabled is None else enabled
+        payload = json.dumps(
+            {"suppress_voice": bool(value)}, separators=(",", ":")
+        ).encode("ascii") + b"\n"
+        try:
+            client.sendall(payload)
+            return True
+        except OSError:
+            return False
+
+    def arm_voice_suppression(self, window_ms: int = 1000) -> bool:
+        """ATVV AUDIO_START 时短暂允许重学习，处理蓝牙重连后的句柄变化。"""
+        with self._lock:
+            client = self._client
+        if client is None or not self._suppression_ack or not self.suppress_voice:
+            return False
+        payload = json.dumps(
+            {"arm_voice_ms": max(100, min(2000, int(window_ms)))},
+            separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+        try:
+            client.sendall(payload)
+            return True
+        except OSError:
+            return False
 
     def _probe_existing(self, server: socket.socket, pid: int,
                         timeout: float = 2.5) -> socket.socket | None:
@@ -484,13 +611,12 @@ class BackKeyTap:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             server.bind(("127.0.0.1", TAP_PORT))
-            server.listen(1)
+            server.listen(8)
         except OSError as e:
             self.log(f"tap 端口绑定失败（已有实例在跑？）: {e}")
             return
         server.settimeout(1.0)
         self.log(f"tap 监听 127.0.0.1:{TAP_PORT}")
-        buffer = b""
         while not self.stop_event.is_set():
             pid = find_rc003_host_pid()
             if pid is None:
@@ -500,7 +626,9 @@ class BackKeyTap:
             client = None
             if self.auto_inject and self._helper_launched_pid != pid:
                 # 先让旧 Gadget 有机会回连，避免每次启动都重新注入弹 UAC
-                client = self._probe_existing(server, pid)
+                timeout = 12.0 if self._refreshed_host_pid == pid else 2.5
+                self._refreshed_host_pid = None
+                client = self._probe_existing(server, pid, timeout=timeout)
                 if client is not None:
                     self._helper_launched_pid = pid
                     self.log("检测到已注入的 Gadget 回连，跳过重复注入")
@@ -515,6 +643,13 @@ class BackKeyTap:
                     continue
             client.settimeout(1.0)
             self.log("helper 已连接")
+            buffer = b""
+            refresh_required = False
+            with self._lock:
+                self._client = client
+            self._set_suppression_ack(False)
+            self._control_ack = False
+            self._send_control(client)
             try:
                 while not self.stop_event.is_set():
                     if find_rc003_host_pid() != pid:
@@ -524,23 +659,49 @@ class BackKeyTap:
                     try:
                         chunk = client.recv(65536)
                     except socket.timeout:
+                        if not self._control_ack and select.select([server], [], [], 0)[0]:
+                            self.log("检测到重复 Gadget 回连；丢弃未响应控制握手的空闲连接")
+                            break
                         continue
+                    except OSError as exc:
+                        self.log(f"helper 连接中断: {exc}，等待自动重连")
+                        break
                     if chunk == b"":
                         break
                     buffer += chunk
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         try:
-                            self._handle_line(json.loads(line.decode("utf-8")))
+                            result = self._handle_line(json.loads(line.decode("utf-8")))
+                            if result == "refresh":
+                                refresh_required = True
+                                break
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             continue
+                    if refresh_required:
+                        break
             finally:
                 client.close()
+                self._set_suppression_ack(False)
                 with self._lock:
+                    if self._client is client:
+                        self._client = None
                     released = set(self._active)
                     self._active = set()
                 for u in sorted(released):
                     self.on_edge(USAGE_NAMES.get(u, str(u)), False)
+            if refresh_required and pid not in self._refresh_attempted:
+                self._set_suppression_ack(False)
+                self._refresh_attempted.add(pid)
+                if self._launch_helper(pid, refresh=True):
+                    deadline = time.monotonic() + 35.0
+                    while time.monotonic() < deadline and not self.stop_event.is_set():
+                        candidate = find_rc003_host_pid()
+                        if candidate and candidate != pid:
+                            self._helper_launched_pid = None
+                            self._refreshed_host_pid = candidate
+                            break
+                        self.stop_event.wait(0.25)
         server.close()
 
     def start(self) -> bool:
@@ -550,6 +711,11 @@ class BackKeyTap:
 
     def stop(self):
         self.stop_event.set()
+        self._set_suppression_ack(False)
+        with self._lock:
+            client = self._client
+        if client is not None:
+            self._send_control(client, enabled=False)
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=3.0)
 

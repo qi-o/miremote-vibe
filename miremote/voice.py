@@ -16,6 +16,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import math
+import os
+import queue
 import sys
 import struct
 import threading
@@ -55,6 +59,10 @@ OP_GET_CAPS = 0x0A
 OP_CAPS_RESP = 0x0B
 OP_MIC_OPEN = 0x0C
 OP_MIC_CLOSE = 0x0D
+OP_START_SEARCH_V1 = 0x08
+OP_STREAM_START = 0x04
+OP_STREAM_STOP = 0x00
+OP_AUDIO_SYNC_V1 = 0x0A
 OP_START_SEARCH = 0x10  # 部分固件按语音键时先来这个
 OP_AUDIO_START = 0x11
 OP_AUDIO_SYNC = 0x12
@@ -62,6 +70,9 @@ OP_AUDIO_STOP = 0x13
 
 OPCODE_NAMES = {
     OP_CAPS_RESP: "CAPS_RESP", OP_MIC_OPEN: "MIC_OPEN", OP_MIC_CLOSE: "MIC_CLOSE",
+    OP_START_SEARCH_V1: "START_SEARCH", OP_STREAM_START: "STREAM_START",
+    OP_STREAM_STOP: "STREAM_STOP",
+    OP_AUDIO_SYNC_V1: "AUDIO_SYNC",
     OP_START_SEARCH: "START_SEARCH", OP_AUDIO_START: "AUDIO_START",
     OP_AUDIO_SYNC: "AUDIO_SYNC", OP_AUDIO_STOP: "AUDIO_STOP",
 }
@@ -116,7 +127,7 @@ class ImaAdpcmDecoder:
             diff += step >> 1
         if nibble & 4:
             diff += step
-        self.predictor += diff if nibble & 8 else -diff
+        self.predictor += -diff if nibble & 8 else diff
         self.predictor = max(-32768, min(32767, self.predictor))
         self.step_index = max(0, min(88, self.step_index + INDEX_TABLE[nibble]))
         return self.predictor
@@ -137,6 +148,57 @@ def write_wav(path: Path, pcm: list[int], rate: int = 16000):
         w.writeframes(struct.pack(f"<{len(pcm)}h", *pcm))
 
 
+class FrameAccumulator:
+    def __init__(self, frame_size: int = 120):
+        self.frame_size = max(1, int(frame_size or 120))
+        self.pending = bytearray()
+
+    def append(self, data: bytes) -> list[bytes]:
+        self.pending.extend(data)
+        frames = []
+        while len(self.pending) >= self.frame_size:
+            frames.append(bytes(self.pending[:self.frame_size]))
+            del self.pending[:self.frame_size]
+        return frames
+
+    def reset(self):
+        self.pending.clear()
+
+
+class StreamingLinearResampler:
+    """跨帧连续的单声道线性重采样器。"""
+
+    def __init__(self, input_rate: int, output_rate: int):
+        if input_rate <= 0 or output_rate <= 0:
+            raise ValueError("sample rate must be positive")
+        self.input_rate = input_rate
+        self.output_rate = output_rate
+        self.step = input_rate / output_rate
+        self.buffer: list[int] = []
+        self.position = 0.0
+
+    def reset(self):
+        self.buffer.clear()
+        self.position = 0.0
+
+    def convert(self, samples: list[int]) -> list[int]:
+        if samples:
+            self.buffer.extend(samples)
+        output = []
+        while self.position + 1 < len(self.buffer):
+            index = int(self.position)
+            fraction = self.position - index
+            current = self.buffer[index]
+            following = self.buffer[index + 1]
+            output.append(int(current + (following - current) * fraction))
+            self.position += self.step
+        consumed = int(self.position)
+        if consumed > 0:
+            del self.buffer[:consumed]
+            self.position -= consumed
+        return output
+
+
 class AtvvClient:
     def __init__(self, addr: int = DEFAULT_ADDR):
         self.addr = addr
@@ -145,6 +207,7 @@ class AtvvClient:
         self.audio_ch = None
         self.ctrl_ch = None
         self.audio_frames: list[bytes] = []
+        self.audio_items: list[object] = []
         self.events: list[tuple[str, bytes]] = []
         self.caps_resp: bytes | None = None
         self.audio_stopped = asyncio.Event()
@@ -154,9 +217,26 @@ class AtvvClient:
         self._decoder = ImaAdpcmDecoder()
         self._v04_frames = False
         self._audio_subscribed = False
-        self.on_audio_live = None  # 微信模式实时回调: callable(raw_frame_bytes)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._mic_open_future = None
+        self._mic_open_requested = False
+        self._capture_lock = threading.Lock()
+        self.stream_id = 0x00
+        self.stream_active = False
+        self.stream_reason: int | None = None
+        self.stop_reason: int | None = None
+        self.protocol_version = 0x0100
+        self.frame_size = 120
+        self.selected_codec = 0x02
+        self.interaction_model = 0
+        self.on_audio_live = None  # 实时音频回调: callable(raw_frame_bytes)
+        self.on_ctrl_live = None   # 控制通道回调（任意通知都算 ATVV 活动）
+        self.on_stream_start_live = None
+        self.on_stream_stop_live = None
+        self.on_codec_sync_live = None
 
     async def connect(self):
+        self._loop = asyncio.get_running_loop()
         if self.addr is None:
             from .blediscover import find_remote_addr
             self.addr = find_remote_addr()
@@ -212,20 +292,104 @@ class AtvvClient:
         op = data[0] if data else -1
         name = OPCODE_NAMES.get(op, f"UNKNOWN_0x{op:02X}")
         print(f"  [控制] {name} {data.hex(' ')}")
+        if self.on_ctrl_live:
+            try:
+                self.on_ctrl_live(data)
+            except Exception:
+                pass
         if op == OP_CAPS_RESP:
             self.caps_resp = data
+            info = self.parse_caps(data)
+            self.protocol_version = info.get("version", self.protocol_version)
+            self.frame_size = info.get("frame_size", self.frame_size)
+            self.selected_codec = info.get("selected_codec", self.selected_codec)
+            self.interaction_model = info.get("interaction", self.interaction_model)
             self.caps_got.set()
+        elif op == OP_AUDIO_SYNC_V1 and len(data) >= 7:
+            # v1.0 控制通道的 0x0A 是 AUDIO_SYNC，不是 caps 响应。
+            # headerless ADPCM 帧必须按该 predictor/index 重置解码器。
+            predictor = struct.unpack(">h", data[4:6])[0]
+            step_index = data[6]
+            with self._capture_lock:
+                self.audio_items.append(("sync", predictor, step_index))
+            if self.on_codec_sync_live:
+                try:
+                    self.on_codec_sync_live(predictor, step_index)
+                except Exception:
+                    pass
         elif op == OP_AUDIO_START:
+            if len(data) >= 4:
+                self.stream_id = data[3]
+            self.stream_active = True
             self.audio_started.set()
         elif op == OP_AUDIO_STOP:
+            self.stream_active = False
             self.audio_stopped.set()
-        elif op == 0x00 and len(data) >= 2 and data[1] == 0x02:
+        elif op == OP_STREAM_STOP:
             # 实测（固件 2671）：松手时遥控器发 `00 02`，MIC_CLOSE 后回 `00 00`
-            self.audio_stopped.set()
+            was_active = self.stream_active
+            self.stream_active = False
+            self.stop_reason = data[1] if len(data) >= 2 else None
+            if was_active:
+                self.audio_stopped.set()
+            self._mic_open_requested = False
+            if self.on_stream_stop_live:
+                try:
+                    self.on_stream_stop_live(data)
+                except Exception:
+                    pass
+        elif op == OP_STREAM_START:
+            # 0x04 是协议级新会话边界；在任何音频包到达前清掉上一流残留。
+            self.reset_capture()
+            self.stream_reason = data[1] if len(data) >= 2 else None
+            self.selected_codec = data[2] if len(data) >= 3 else self.selected_codec
+            if len(data) >= 4:
+                self.stream_id = data[3]
+            self.stream_active = True
+            self.stop_reason = None
+            self.audio_stopped.clear()
+            self.audio_started.set()
+            if self.on_stream_start_live:
+                try:
+                    self.on_stream_start_live(data)
+                except Exception:
+                    pass
+        elif op in (OP_START_SEARCH_V1, OP_START_SEARCH):
+            # RC003 会用 START_SEARCH 请求主机开流；真正的流类型仍以
+            # 随后的 0x04 reason/session 为准。
+            self._schedule_mic_open_response()
+
+    def _schedule_mic_open_response(self):
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        if self._mic_open_requested:
+            return
+        pending = self._mic_open_future
+        if pending is not None and not pending.done():
+            return
+        self._mic_open_requested = True
+        future = asyncio.run_coroutine_threadsafe(
+            self._respond_to_mic_open_request(), loop
+        )
+        self._mic_open_future = future
+        future.add_done_callback(self._mic_open_done)
+
+    async def _respond_to_mic_open_request(self):
+        await self.write(bytes([OP_MIC_OPEN, 0x00]))
+
+    def _mic_open_done(self, future):
+        try:
+            future.result()
+        except Exception as exc:
+            self._mic_open_requested = False
+            print(f"响应 MIC_OPEN 请求失败: {exc}")
 
     def _on_audio(self, _sender, args):
         data = ibuffer_bytes(args.characteristic_value)
-        self.audio_frames.append(data)
+        with self._capture_lock:
+            self.audio_frames.append(data)
+            self.audio_items.append(("audio", data))
         self.events.append(("audio", data))
         if self.on_audio_live:
             try:
@@ -252,33 +416,117 @@ class AtvvClient:
         print(f"音频通道已订阅 (状态 {st})")
 
     async def mic_open(self):
-        """开始一段录音（常驻会话用）。"""
+        """显式开启主机录音流（仅供诊断/手动录音，不用于物理按键会话）。"""
         await self.subscribe_audio()
-        self.audio_frames.clear()
+        with self._capture_lock:
+            self.audio_frames.clear()
+            self.audio_items.clear()
         self.audio_stopped.clear()
         self.audio_started.clear()
         await self.write(bytes([OP_MIC_OPEN, 0x00]))
 
     async def mic_close(self):
-        await self.write(bytes([OP_MIC_CLOSE, 0x00]))
+        await self.write(bytes([OP_MIC_CLOSE, self.stream_id & 0xFF]))
+
+    async def resubscribe_audio(self):
+        """重订阅音频通知（言灵同款 REOPEN RESET 序列的核心步骤）。
+
+        固件 2671 在 MIC_CLOSE 后音频通知订阅会失效，下一次 mic_open 后
+        物理流不再送达主机；必须 取消订阅+禁用通知 -> 停 180ms ->
+        重新订阅+启用通知 才能恢复。
+        """
+        from winrt.windows.devices.bluetooth.genericattributeprofile import (
+            GattClientCharacteristicConfigurationDescriptorValue as CCCD,
+        )
+        for ch, token in list(self._tokens):
+            if ch is self.audio_ch:
+                try:
+                    ch.remove_value_changed(token)
+                except Exception:
+                    pass
+                self._tokens.remove((ch, token))
+                break
+        try:
+            none_v = getattr(CCCD, "NONE", None)
+            if none_v is not None:
+                await self.audio_ch.write_client_characteristic_configuration_descriptor_async(none_v)
+        except Exception:
+            pass
+        await asyncio.sleep(0.18)
+        token = self.audio_ch.add_value_changed(self._on_audio)
+        self._tokens.append((self.audio_ch, token))
+        st = await self.audio_ch.write_client_characteristic_configuration_descriptor_async(
+            CCCD.NOTIFY
+        )
+        print(f"音频通知已重订阅 (状态 {st})")
+
+    def reset_capture(self):
+        with self._capture_lock:
+            self.audio_frames.clear()
+            self.audio_items.clear()
 
     def drain_frames(self) -> list[bytes]:
-        frames, self.audio_frames = self.audio_frames, []
+        with self._capture_lock:
+            frames, self.audio_frames = self.audio_frames, []
+            self.audio_items = []
         return frames
 
+    def drain_audio_items(self) -> list[object]:
+        with self._capture_lock:
+            items, self.audio_items = self.audio_items, []
+            self.audio_frames = []
+        return items
+
     @staticmethod
-    def frames_to_pcm(frames: list[bytes]) -> list[int]:
-        """ADPCM 帧序列 -> PCM 采样（v0.4 帧 134B 带头，v1.0 帧 120B 无头）。"""
+    def decode_audio_items(items: list[object], frame_size: int = 120) -> tuple[list[int], dict]:
+        """按 ATVV 帧边界与 AUDIO_SYNC 顺序解码一段捕获。"""
         pcm: list[int] = []
         dec = ImaAdpcmDecoder()
-        for f in frames:
-            if len(f) == 134:
+        accumulator = FrameAccumulator(frame_size)
+        stats = {
+            "notifications": 0,
+            "raw_bytes": 0,
+            "decoded_frames": 0,
+            "sync_count": 0,
+            "headered_frames": 0,
+            "chunk_lengths": {},
+            "partial_bytes": 0,
+        }
+        for item in items:
+            if isinstance(item, tuple) and item and item[0] == "sync":
+                accumulator.reset()
+                dec = ImaAdpcmDecoder(predictor=int(item[1]), step_index=int(item[2]))
+                stats["sync_count"] += 1
+                continue
+            f = item[1] if isinstance(item, tuple) and item and item[0] == "audio" else item
+            if not isinstance(f, (bytes, bytearray)) or not f:
+                continue
+            f = bytes(f)
+            stats["notifications"] += 1
+            stats["raw_bytes"] += len(f)
+            key = str(len(f))
+            stats["chunk_lengths"][key] = stats["chunk_lengths"].get(key, 0) + 1
+
+            # 部分 v0.4/兼容固件把 predictor/index 放在每帧 6B 头里。
+            if len(f) in (frame_size + 6, 134):
+                accumulator.reset()
                 dec = ImaAdpcmDecoder(
                     predictor=struct.unpack(">h", f[3:5])[0], step_index=f[5]
                 )
                 pcm.extend(dec.decode(f[6:]))
-            else:
-                pcm.extend(dec.decode(f))
+                stats["decoded_frames"] += 1
+                stats["headered_frames"] += 1
+                continue
+
+            for frame in accumulator.append(f):
+                pcm.extend(dec.decode(frame))
+                stats["decoded_frames"] += 1
+        stats["partial_bytes"] = len(accumulator.pending)
+        return pcm, stats
+
+    @staticmethod
+    def frames_to_pcm(frames: list[bytes], frame_size: int = 120) -> list[int]:
+        pcm, _stats = AtvvClient.decode_audio_items(frames, frame_size=frame_size)
         return pcm
 
     async def get_caps(self, timeout: float = 5.0) -> bytes | None:
@@ -294,15 +542,23 @@ class AtvvClient:
         """宽松解析，兼容固件 2671 的字节对调差异。"""
         info = {"raw": resp.hex(" "), "length": len(resp)}
         if len(resp) >= 7:
-            info["version_byte"] = f"0x{resp[1]:02X}"  # 0x01 即 v1.0
+            version = (resp[1] << 8) | resp[2]
+            info["version"] = version
+            info["version_byte"] = f"0x{version:04X}"
             codecs_std = resp[3]
+            interaction = resp[4]
             # 对调差异：标准位无效而相邻字节含 8/16kHz ADPCM 位时换位解析
             if (codecs_std & 0x0F) == 0 and (resp[4] & 0x0F) != 0:
                 codecs_std = resp[4]
+                interaction = 0x03
                 info["quirk"] = "codec 字节对调兼容"
+            frame_size = (resp[5] << 8) | resp[6]
             info["adpcm_16k"] = bool(codecs_std & 0x02)
             info["adpcm_8k"] = bool(codecs_std & 0x01)
-            info["max_frame_size"] = resp[6] if len(resp) > 6 else None
+            info["selected_codec"] = 0x02 if codecs_std & 0x02 else 0x01
+            info["interaction"] = interaction
+            info["frame_size"] = frame_size or 120
+            info["max_frame_size"] = frame_size or 120
         return info
 
     async def record(self, seconds: float, wav_out: Path) -> bool:
@@ -569,19 +825,53 @@ class VoiceDaemon:
 
     def __init__(self, on_text, log=print, model: str = "medium",
                  addr: int = DEFAULT_ADDR, mode: str = "local",
-                 wechat_hotkey: str | None = None):
+                 wechat_hotkey: str | None = None,
+                 live: bool = True, ready_delay: float = 0.45,
+                 diagnostics: bool = False,
+                 diagnostics_root: Path | None = None):
         self.on_text = on_text      # callable(text: str)
         self.log = log
         self.model = model
         self.addr = addr
         self.mode = mode            # "local"=本地 whisper；"wechat"=桥接输入法
         self.wechat_hotkey = wechat_hotkey  # 微信模式：触发输入法语音的组合键名列表
+        self.live = live            # 微信模式 v3：按下即实时送音（False=松手后整段播放）
+        self.ready_delay = ready_delay  # 实时模式：面板开启热键后等输入法就绪的秒数
+        self.diagnostics = diagnostics
+        self.diagnostics_root = diagnostics_root
         self.loop: asyncio.AbstractEventLoop | None = None
         self._cmds: asyncio.Queue | None = None
         self._ready = threading.Event()
         self._collecting = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._live_q: queue.Queue | None = None        # 实时模式：重采样后待播样本
+        self._live_drain = threading.Event()            # 松手信号：排干队列后收尾
+        self._live_started = threading.Event()
+        self._live_ready = threading.Event()
+        self._live_active = False                       # 实时会话线程存活标记
+        self._live_thread: threading.Thread | None = None
+        self._live_fallback_needed = False
+        self._live_bytes_written = 0
+        self._live_failed = False
+        self._live_failure_reason = ""
+        self._live_provider_started = False
+        self._live_fallback_capture = None
+        self._live_generation = 0
+        self._live_request_at = 0.0
+        self._live_first_audio_logged = False
+        self._live_first_write_logged = False
+        self._atvv_last = 0.0            # 最近一次 ATVV 活动（ctrl 通知/音频帧）
+        self._remote_f5_swallowed_at = 0.0
+        self._live_prelude: list[object] = []  # 会话开启前的 sync/音频（开头不丢字）
+        self._last_session_end = 0.0     # 上一会话结束时刻（自检防抖）
+        self._live_lock = threading.Lock()  # _live_write 的解码状态互斥
+        self._live_state_lock = threading.Lock()
+        self._live_order_lock = threading.Lock()
+        self._live_pipeline_ready = False
+        self._playback_lock = threading.Lock()  # v2 播放互斥（防并发写 CABLE）
+        self._capture_frame_size = 120
+        self._capture_meta = {}
 
     # ---- 生命周期 ----
     def start(self) -> bool:
@@ -591,8 +881,12 @@ class VoiceDaemon:
 
     def stop(self):
         self._stop.set()
+        self._live_drain.set()
+        self._live_started.set()
+        self._stop_live_provider("守护停止")
         if self._thread:
             self._thread.join(timeout=5)
+        self._close_cable_stream()  # 常开流随守护退出统一关闭
 
     @property
     def ready(self) -> bool:
@@ -611,62 +905,80 @@ class VoiceDaemon:
                 resp = await cli.get_caps()
                 if not resp:
                     raise RuntimeError("GET_CAPS 无响应")
-                self.log(f"语音引擎就绪 ({cli.parse_caps(resp).get('adpcm_16k') and '16kHz' or '?'})")
+                caps = cli.parse_caps(resp)
+                self.log(
+                    "语音引擎就绪 "
+                    f"({caps.get('adpcm_16k') and '16kHz' or '?'}, "
+                    f"ATVV {caps.get('version_byte', '?')}, "
+                    f"frame={caps.get('frame_size', '?')}B, "
+                    f"interaction=0x{caps.get('interaction', 0):02X})"
+                )
+                # 常驻订阅（收帧不丢），但不常驻 mic_open：固件 2671 的主机流
+                # （mic_open 命令流，start_reason=0x00）零音频，只有按住语音键
+                # 触发的物理流（start_reason=0x03）有音频。言灵是"订阅常驻、
+                # mic_open 响应式"；miremote v1/v2 也是 begin 才 mic_open。
+                # 会话开始由 on_voice（LL 钩子判定）或音频帧自检触发。
+                await cli.subscribe_audio()
+                cli.on_audio_live = self._on_atvv_frame
+                cli.on_ctrl_live = self._on_atvv_ctrl
+                cli.on_stream_start_live = self._on_atvv_stream_start
+                cli.on_stream_stop_live = self._on_atvv_stream_stop
+                cli.on_codec_sync_live = self._on_atvv_codec_sync
                 self._ready.set()
                 while not self._stop.is_set():
-                    try:
-                        cmd = await asyncio.wait_for(self._cmds.get(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        continue
-                    if cmd == "begin":
-                        if self._collecting:
+                    if not self._collecting:
+                        # 空闲：等 begin 命令（on_voice / rawinput 兜底 / 帧自检）
+                        try:
+                            cmd = await asyncio.wait_for(self._cmds.get(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            if cli.audio_stopped.is_set():
+                                # 游离短流的结束信号：清掉，避免下次误判
+                                cli.audio_stopped.clear()
                             continue
-                        self._collecting = True
-                        await cli.mic_open()
-                        self.log("录音中…（按住说话）")
-                        if self.mode == "wechat":
-                            # 微信模式 v2（切换式）：录音期间零注入（语音键 F5 透传
-                            # 会干扰微信组合键检测），音频先缓冲；松手后再
-                            # 短击热键 -> 播放 -> 再短击关闭
-                            self._live_buffer = []
-                            cli.on_audio_live = self._buffer_write
-                        # 等松手信号（遥控器 00 02）或 finish 命令
-                        stop_wait = asyncio.create_task(cli.audio_stopped.wait())
-                        cmd_wait = asyncio.create_task(self._cmds.get())
-                        done, pending = await asyncio.wait(
-                            {stop_wait, cmd_wait},
+                        if cmd == "prepare_live":
+                            await self._prepare_live_session(cli)
+                        elif cmd == "begin":
+                            await self._begin_session(cli)
+                        continue
+                    # 会话中：等遥控器松手（00 02）/ finish 兜底。
+                    # v2 松手播放模式不能把固定时长 watchdog 放进 FIRST_COMPLETED：
+                    # 历史上 4s watchdog 已经导致过录音被截断；本轮 2s dog
+                    # 与用户复现的固定 1.9s 对上。该模式有 RawInput up 兜底。
+                    stop_wait = asyncio.create_task(cli.audio_stopped.wait())
+                    cmd_wait = asyncio.create_task(self._cmds.get())
+                    dog = None
+                    wait_set = {stop_wait, cmd_wait}
+                    if self.mode != "wechat" or self.live:
+                        dog = asyncio.create_task(asyncio.sleep(2.0))
+                        wait_set.add(dog)
+                    frame_mark = len(cli.audio_frames)
+                    try:
+                        done, _pending = await asyncio.wait(
+                            wait_set,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                    elif cmd == "finish":
-                        pass  # 上面的 wait 已处理
-                    if self._collecting:
-                        self._collecting = False
-                        for t in ("stop_wait", "cmd_wait"):
-                            task = locals().get(t)
-                            if task and not task.done():
-                                task.cancel()
-                        frames = cli.drain_frames()
+                    finally:
+                        for t in (stop_wait, cmd_wait, dog):
+                            if t is not None and not t.done():
+                                t.cancel()
+                    should_end = stop_wait in done
+                    if cmd_wait in done and not should_end:
+                        command = cmd_wait.result()
+                        if command != "finish":
+                            # RawInput/控制流同时触发的重复 begin 不能结束会话。
+                            continue
                         try:
-                            await cli.mic_close()
-                        except Exception:
+                            await asyncio.wait_for(cli.audio_stopped.wait(), 0.26)
+                        except asyncio.TimeoutError:
                             pass
-                        if self.mode == "wechat":
-                            # 切换式：松手后 短击热键->播放缓冲->再短击关闭
-                            cli.on_audio_live = None
-                            buffered = list(getattr(self, "_live_buffer", []))
-                            if buffered:
-                                threading.Thread(
-                                    target=self._wechat_playback, args=(buffered,),
-                                    daemon=True,
-                                ).start()
-                            else:
-                                self.log("(没有收到音频帧)")
-                        elif frames:
-                            threading.Thread(
-                                target=self._pipeline, args=(frames,), daemon=True
-                            ).start()
-                        else:
-                            self.log("(没有收到音频帧)")
+                        should_end = True
+                    if dog is not None and dog in done and not should_end:
+                        if len(cli.audio_frames) != frame_mark:
+                            continue
+                        self.log("(会话开启但 2 秒无音频，结束)")
+                        should_end = True
+                    if should_end:
+                        await self._end_session(cli)
             except Exception as e:
                 self._ready.clear()
                 self.log(f"语音连接断开/出错({type(e).__name__}: {e})，2 秒后重连…")
@@ -677,6 +989,258 @@ class VoiceDaemon:
                 except Exception:
                     pass
                 await asyncio.sleep(2)
+
+    # ---- ATVV 常驻回调（winrt 线程） ----
+    def _on_atvv_ctrl(self, data: bytes):
+        self._atvv_last = time.monotonic()
+        if not data:
+            return
+        if data[0] in (OP_START_SEARCH_V1, OP_START_SEARCH):
+            self.log("ATVV START_SEARCH，响应 MIC_OPEN")
+            if self.mode == "wechat" and self.live:
+                self._live_request_at = time.monotonic()
+                self._put("prepare_live")
+        elif data[0] == OP_MIC_OPEN and len(data) >= 3:
+            self.log(f"ATVV MIC_OPEN_ERROR code=0x{data[1]:02X}{data[2]:02X}")
+
+    def _on_atvv_stream_start(self, data: bytes):
+        """控制通道 0x04 是 ATVV 会话真实开始，F5 只作为兜底。"""
+        self._atvv_last = time.monotonic()
+        reason = data[1] if len(data) > 1 else 0xFF
+        codec = data[2] if len(data) > 2 else 0xFF
+        stream_id = data[3] if len(data) > 3 else 0x00
+        self.log(
+            f"ATVV AUDIO_START reason=0x{reason:02X} "
+            f"codec=0x{codec:02X} stream=0x{stream_id:02X}"
+        )
+        if self.mode == "wechat" and self.live and self._live_request_at > 0:
+            elapsed = (time.monotonic() - self._live_request_at) * 1000
+            self.log(f"实时延迟 AUDIO_START +{elapsed:.0f}ms")
+        if not self._collecting and time.monotonic() - self._last_session_end > 0.5:
+            self.log("检测到语音流，开始会话…")
+            self.begin()
+
+    def _on_atvv_stream_stop(self, data: bytes):
+        self._atvv_last = time.monotonic()
+        reason = data[1] if len(data) > 1 else 0xFF
+        self.log(f"ATVV AUDIO_STOP reason=0x{reason:02X}")
+        if self.mode == "wechat" and self.live and self._live_request_at > 0:
+            elapsed = (time.monotonic() - self._live_request_at) * 1000
+            self.log(f"实时延迟 AUDIO_STOP +{elapsed:.0f}ms")
+
+    def _on_atvv_codec_sync(self, predictor: int, step_index: int):
+        item = ("sync", predictor, step_index)
+        if not self._collecting:
+            if self.mode == "wechat" and self.live:
+                with self._live_order_lock:
+                    self._live_prelude.append(item)
+            return
+        self._session_sync_count = getattr(self, "_session_sync_count", 0) + 1
+        if self._session_sync_count <= 3:
+            self.log(
+                f"ATVV AUDIO_SYNC predictor={predictor} "
+                f"step={step_index}"
+            )
+        if self.mode == "wechat" and self.live:
+            with self._live_order_lock:
+                if not self._live_pipeline_ready or not self._live_process_item(item):
+                    self._live_prelude.append(item)
+
+    def _on_atvv_frame(self, frame: bytes):
+        """音频帧到达：更新活动时间戳；v3 live 模式空闲时自检开会话。"""
+        self._atvv_last = time.monotonic()
+        if self._collecting:
+            if self._live_q is not None:
+                item = ("audio", frame)
+                with self._live_order_lock:
+                    if not self._live_pipeline_ready or not self._live_process_item(item):
+                        # 流未就绪窗口（tap/开流期间）的帧先进 prelude
+                        self._live_prelude.append(item)
+            return
+        # v2（松手播放）模式：会话完全由 rawinput 的 F5 down/up 驱动，
+        # 帧只在上面的 collecting 分支缓冲，绝不自检触发 begin——否则与
+        # F5 触发交叠产生并发会话、并发写 CABLE（AUDCLNT_E_OUT_OF_ORDER）。
+        if not self.live:
+            return
+        if time.monotonic() - self._last_session_end > 0.5:
+            if not self._live_prelude:
+                self.log("检测到语音流，开始会话…")
+            with self._live_order_lock:
+                self._live_prelude.append(("audio", frame))
+            self.begin()
+
+    def atvv_recent(self, within_ms: float = 250.0) -> bool:
+        """最近 within_ms 毫秒内遥控器 ATVV 是否活跃（供 LL 钩子判定 F5 来源）。"""
+        return self._atvv_last > 0 and (time.monotonic() - self._atvv_last) * 1000.0 <= within_ms
+
+    def note_remote_f5(self, down: bool):
+        """LL hook 已完成 RC003 F5 吞键；provider 可安全发送合成快捷键。"""
+        if down:
+            self._remote_f5_swallowed_at = time.monotonic()
+
+    def _wait_remote_f5_gate(self, timeout: float = 0.35) -> bool:
+        request_at = self._live_request_at
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stop.is_set():
+            swallowed_at = self._remote_f5_swallowed_at
+            if swallowed_at > 0 and swallowed_at >= request_at - 0.15:
+                elapsed = (time.monotonic() - request_at) * 1000 if request_at > 0 else 0
+                self.log(f"F5 吞键门禁已通过 +{elapsed:.0f}ms")
+                return True
+            time.sleep(0.002)
+        self.log("F5 吞键门禁超时，已超过钩子判定预算后继续")
+        return False
+
+    # ---- 会话生命周期 ----
+    async def _prepare_live_session(self, _cli):
+        if self.mode != "wechat" or not self.live or self._live_active:
+            return
+        self._capture_frame_size = _cli.frame_size
+        self._live_generation += 1
+        generation = self._live_generation
+        self._live_q = queue.Queue()
+        self._live_drain.clear()
+        self._live_started.clear()
+        self._live_ready.clear()
+        self._live_failed = False
+        self._live_failure_reason = ""
+        self._live_fallback_needed = False
+        self._live_bytes_written = 0
+        self._live_first_audio_logged = False
+        self._live_first_write_logged = False
+        if self._live_request_at <= 0:
+            self._live_request_at = time.monotonic()
+        self._live_fallback_capture = None
+        self._live_active = True
+        with self._live_lock:
+            self._live_decoder = None
+            self._live_accumulator = None
+            self._live_resampler = None
+        with self._live_order_lock:
+            self._live_pipeline_ready = False
+        self._live_thread = threading.Thread(
+            target=self._live_session,
+            args=(generation,),
+            daemon=True,
+            name="voice-live",
+        )
+        self._live_thread.start()
+
+    async def _begin_session(self, cli):
+        if self._collecting:
+            return
+        if cli.audio_stopped.is_set():
+            # 流已停（结束信号先于会话开启的超短按）：丢弃
+            self.log("(超短按，丢弃)")
+            if self.mode == "wechat" and self.live and self._live_active:
+                self._mark_live_failure("超短按在会话建立前已结束")
+                self._live_started.set()
+                self._live_drain.set()
+                self._live_prelude = []
+            cli.audio_stopped.clear()
+            cli.audio_started.clear()
+            return
+        self._collecting = True
+        cli.audio_stopped.clear()
+        cli.audio_started.clear()
+        self._session_sync_count = 0
+        self._capture_frame_size = cli.frame_size
+        self._capture_meta = {
+            "protocol_version": cli.protocol_version,
+            "frame_size": cli.frame_size,
+            "stream_reason": cli.stream_reason,
+            "stream_id": cli.stream_id,
+            "codec": cli.selected_codec,
+        }
+        # RC003 的 START_SEARCH 响应由 AtvvClient 处理；会话 begin 只负责
+        # 建立本地收集边界，绝不能再次主动 MIC_OPEN。
+        if self.mode == "wechat" and self.live:
+            await self._prepare_live_session(cli)
+            self._live_started.set()
+            self.log("录音中…（实时送入输入法，松手出字）")
+        else:
+            self.log("录音中…（按住说话）")
+            # local 模式帧全在 cli.audio_frames（含 prelude 时期的帧）
+
+    async def _end_session(self, cli):
+        # 遥控器会在 AUDIO_STOP 后补少量尾包；保持 collecting/live writer
+        # 80ms，避免尾音被误判成下一段或在 provider 提交后才写入 CABLE。
+        await asyncio.sleep(0.08)
+        self._collecting = False
+        frames = cli.drain_audio_items()
+        if self.mode == "wechat" and self.live:
+            self._live_drain.set()
+        try:
+            await cli.mic_close()
+        except Exception:
+            pass
+        # 固件 2671：MIC_CLOSE 后音频通知订阅失效（下一段收不到流），
+        # 按言灵 REOPEN RESET 序列重订阅恢复
+        try:
+            await cli.resubscribe_audio()
+        except Exception:
+            pass
+        self._last_session_end = time.monotonic()
+        has_audio = any(
+            not isinstance(x, tuple) or (x and x[0] == "audio")
+            for x in frames
+        )
+        # 连续两段无音频 = 链路已死，抛异常走外层断线重连
+        if not has_audio and self.mode == "wechat":
+            self._empty_streak = getattr(self, "_empty_streak", 0) + 1
+            if self._empty_streak >= 2:
+                self._empty_streak = 0
+                self.log("(连续无音频，重置蓝牙链路)")
+                raise RuntimeError("ATVV 链路无音频，重连")
+        else:
+            self._empty_streak = 0
+        if self.mode == "wechat":
+            if self.live:
+                # v4 实时：AUDIO_STOP 后尾包/队列排干，再松开热键。
+                live_thread = getattr(self, "_live_thread", None)
+                if live_thread is not None and live_thread.is_alive():
+                    await asyncio.to_thread(live_thread.join, 1.5)
+                if live_thread is not None and live_thread.is_alive():
+                    self._mark_live_failure("实时队列 1.5 秒内未排空")
+                    self._stop_live_provider("队列排空超时")
+                    await asyncio.to_thread(live_thread.join, 0.5)
+                self._live_q = None
+                self._live_started.clear()
+                self._live_prelude = []
+                self._live_request_at = 0.0
+                if not getattr(self, "_live_fallback_needed", False):
+                    return
+                self.log("实时桥接失败，本段回退为松手播放")
+            # v2 松手播放，或 v3 门禁失败后的本段回退
+            if True:
+                buffered = list(frames)
+                if any(
+                    not isinstance(x, tuple) or (x and x[0] == "audio")
+                    for x in buffered
+                ):
+                    meta = dict(self._capture_meta)
+                    meta.update({
+                        "frame_size": cli.frame_size,
+                        "stream_reason": cli.stream_reason,
+                        "stream_id": cli.stream_id,
+                        "codec": cli.selected_codec,
+                        "stop_reason": cli.stop_reason,
+                    })
+                    threading.Thread(
+                        target=self._wechat_playback, args=(buffered, meta),
+                        daemon=True,
+                    ).start()
+                else:
+                    self.log("(没有收到音频帧)")
+        elif frames:
+            meta = dict(self._capture_meta)
+            meta["frame_size"] = cli.frame_size
+            threading.Thread(
+                target=self._pipeline, args=(frames, meta), daemon=True
+            ).start()
+        else:
+            self.log("(没有收到音频帧)")
+        self._live_prelude = []
 
     # ---- 线程安全的对外接口 ----
     def begin(self):
@@ -690,21 +1254,73 @@ class VoiceDaemon:
         if loop and self._cmds is not None:
             loop.call_soon_threadsafe(self._cmds.put_nowait, cmd)
 
-    # ---- 收尾流水线（工作线程）----
-    def _pipeline(self, frames: list[bytes]):
+    # ---- 收尾流水线（local 模式工作线程）----
+    @staticmethod
+    def _pcm_metrics(pcm: list[int]) -> dict:
+        if not pcm:
+            return {"duration": 0.0, "rms": 0.0, "peak": 0, "nonzero_pct": 0.0}
+        square_sum = sum(sample * sample for sample in pcm)
+        nonzero = sum(sample != 0 for sample in pcm)
+        return {
+            "duration": len(pcm) / 16000.0,
+            "rms": math.sqrt(square_sum / len(pcm)),
+            "peak": max(abs(sample) for sample in pcm),
+            "nonzero_pct": nonzero * 100.0 / len(pcm),
+        }
+
+    def _write_capture_diagnostics(self, items, pcm, stats, meta) -> Path | None:
+        if not self.diagnostics:
+            return None
         try:
-            pcm = AtvvClient.frames_to_pcm(frames)
+            root = self.diagnostics_root or (
+                Path(os.environ.get("APPDATA", str(Path.home())))
+                / "MiRemoteVibe" / "diagnostics"
+            )
+            root.mkdir(parents=True, exist_ok=True)
+            wav_path = root / "last_utterance.wav"
+            raw_path = root / "last_capture.adpcm"
+            json_path = root / "last_capture.json"
+            write_wav(wav_path, pcm)
+            raw = bytearray()
+            syncs = []
+            for item in items:
+                if isinstance(item, tuple) and item and item[0] == "sync":
+                    syncs.append({
+                        "byte_offset": len(raw),
+                        "predictor": int(item[1]),
+                        "step_index": int(item[2]),
+                    })
+                elif isinstance(item, tuple) and item and item[0] == "audio":
+                    raw.extend(item[1])
+                elif isinstance(item, (bytes, bytearray)):
+                    raw.extend(item)
+            raw_path.write_bytes(raw)
+            payload = {"capture": meta, "decode": stats, "pcm": self._pcm_metrics(pcm), "syncs": syncs}
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return wav_path
+        except Exception as exc:
+            self.log(f"诊断文件写入失败: {exc}")
+            return None
+
+    def _decode_session(self, items, meta):
+        frame_size = int((meta or {}).get("frame_size") or self._capture_frame_size or 120)
+        pcm, stats = AtvvClient.decode_audio_items(items, frame_size=frame_size)
+        metrics = self._pcm_metrics(pcm)
+        return pcm, stats, metrics
+
+    def _pipeline(self, frames: list[bytes], meta: dict | None = None):
+        try:
+            pcm, stats, metrics = self._decode_session(frames, meta)
             if not pcm:
                 self.log("(音频为空)")
                 return
-            if self.mode == "wechat":
-                # 微信模式：把 PCM 写进 VB-CABLE 虚拟声卡，由输入法识别润色
-                self._stream_to_cable(pcm)
-                return
             wav_path = Path.cwd() / "last_utterance.wav"
             write_wav(wav_path, pcm)
-            dur = len(pcm) / 16000
-            self.log(f"收音 {dur:.1f}s，转写中…")
+            self.log(
+                f"收音 {metrics['duration']:.1f}s / {stats['notifications']}包 / "
+                f"{stats['raw_bytes']}B，RMS={metrics['rms']:.0f} "
+                f"peak={metrics['peak']} sync={stats['sync_count']}，转写中…"
+            )
             text = transcribe_local(wav_path, model_name=self.model)
             if text:
                 self.log(f"识别: {text}")
@@ -716,58 +1332,309 @@ class VoiceDaemon:
             self.log(f"语音流水线异常: {e}\n{traceback.format_exc()}")
 
     def _press_hotkey(self, down: bool):
-        """按下/松开输入法语音快捷键（兼容旧按住模式，一般不再使用）。"""
+        """按住式输入法语音热键：down=按下并保持（开录音），up=松开（结束识别上屏）。
+
+        用户微信输入法的语音热键是 Ctrl+Alt+V 按住式；要求 LL 钩子已吞掉
+        RC003 的 F5（否则 F5 在场会干扰组合键检测，浮窗不出现——v1 教训）。
+        """
         if not self.wechat_hotkey:
-            return
+            return False
         try:
             from . import actions
             from .keys import name_to_vk
             vks = [name_to_vk(n) for n in self.wechat_hotkey]
+            sent = True
             if down:
                 for vk in vks:
-                    actions._tap(vk)
+                    sent = actions._tap(vk) and sent
             else:
                 for vk in reversed(vks):
-                    actions._tap(vk, up=True)
+                    sent = actions._tap(vk, up=True) and sent
+            return sent
         except Exception as e:
             self.log(f"快捷键触发失败: {e}")
+            return False
 
-    def _tap_hotkey(self):
-        """短击切换式语音热键（微信 Ctrl+Win+Shift：开启/结束持续语音）。"""
+    def _tap_hotkey(self, hold_ms: int = 80) -> bool:
+        """完整短按一次输入法热键；WeType toggle 必须在等待面板前完成 key-up。"""
         if not self.wechat_hotkey:
-            return
+            self.log("快捷键触发失败: 未配置微信语音快捷键")
+            return False
+        down_sent = False
+        up_sent = False
+        try:
+            down_sent = self._press_hotkey(down=True)
+            if not down_sent:
+                return False
+            time.sleep(max(0.03, min(0.3, hold_ms / 1000.0)))
+            up_sent = self._press_hotkey(down=False)
+            return up_sent
+        except Exception as exc:
+            self.log(f"快捷键短按失败: {exc}")
+            return False
+        finally:
+            if not up_sent:
+                self._press_hotkey(down=False)
+
+    # ---- 微信模式 v5：ATVV 驱动 + provider toggle 的实时流 ----
+    def _start_live_provider(self) -> bool:
+        with self._live_state_lock:
+            if self._live_provider_started:
+                return True
+            self._live_provider_started = True
+            if self._live_request_at <= 0:
+                self._live_request_at = time.monotonic()
+        if self._tap_hotkey(80):
+            self.log("WeType toggle 已发送（启动，80ms）")
+            return True
+        with self._live_state_lock:
+            self._live_provider_started = False
+        return False
+
+    def _stop_live_provider(self, reason: str) -> bool:
+        with self._live_state_lock:
+            if not self._live_provider_started:
+                return False
+            self._live_provider_started = False
+        sent = self._tap_hotkey(80)
+        self.log(
+            f"WeType toggle 已发送（提交，80ms，reason={reason}）"
+            if sent else f"WeType toggle 提交失败（reason={reason}）"
+        )
+        return sent
+
+    def _close_stale_wetype_panel(self):
         try:
             from . import actions
-            from .keys import name_to_vk
-            vks = [name_to_vk(n) for n in self.wechat_hotkey]
-            for vk in vks:
-                actions._tap(vk)
-            time.sleep(0.22)
-            for vk in reversed(vks):
-                actions._tap(vk, up=True)
-        except Exception as e:
-            self.log(f"切换热键触发失败: {e}")
+            if actions.close_windows(r"^语音输入$"):
+                deadline = time.monotonic() + 0.2
+                while time.monotonic() < deadline and self._wetype_panel_visible():
+                    time.sleep(0.02)
+                self.log("已关闭上一轮残留的 WeType 语音面板")
+        except Exception as exc:
+            self.log(f"关闭残留 WeType 面板失败: {exc}")
 
-    # ---- 微信模式：缓冲 + 切换式播放 ----
-    def _buffer_write(self, frame: bytes):
-        """录音期实时回调：只缓冲不播放（F5 透传期间零注入零播放）。"""
-        buf = getattr(self, "_live_buffer", None)
-        if buf is not None:
-            buf.append(frame)
+    def _mark_live_failure(self, reason: str):
+        first = False
+        with self._live_state_lock:
+            if not self._live_failed:
+                first = True
+            self._live_failed = True
+            self._live_fallback_needed = self._live_bytes_written == 0
+            self._live_failure_reason = reason
+        if first:
+            self.log(f"实时桥接门禁失败: {reason}")
 
-    def _wechat_playback(self, frames: list[bytes]):
-        """松手后（工作线程）：短击开听 -> 播放缓冲到 CABLE -> 短击结束。"""
+    @staticmethod
+    def _wetype_panel_visible() -> bool:
         try:
-            pcm = AtvvClient.frames_to_pcm(frames)
+            from . import actions
+            return bool(actions.find_windows(r"^语音输入$"))
+        except Exception:
+            return False
+
+    def _wait_wetype_ready(self) -> bool:
+        timeout = self._wetype_ready_timeout()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if self._wetype_panel_visible():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _wetype_ready_timeout(self) -> float:
+        return max(1.2, self.ready_delay)
+
+    def _reset_live_pipeline(self):
+        rate = int(getattr(self, "_live_rate", 0))
+        if rate <= 0:
+            raise RuntimeError("CABLE sample rate unavailable")
+        with self._live_lock:
+            self._live_decoder = ImaAdpcmDecoder()
+            self._live_accumulator = FrameAccumulator(self._capture_frame_size)
+            self._live_resampler = StreamingLinearResampler(16000, rate)
+
+    def _live_process_item(self, item: object) -> bool:
+        q = self._live_q
+        if q is None or self._live_failed:
+            return q is not None
+        packets = []
+        try:
+            with self._live_lock:
+                decoder = getattr(self, "_live_decoder", None)
+                accumulator = getattr(self, "_live_accumulator", None)
+                resampler = getattr(self, "_live_resampler", None)
+                if decoder is None or accumulator is None or resampler is None:
+                    return False
+                if isinstance(item, tuple) and item and item[0] == "sync":
+                    accumulator.reset()
+                    decoder.predictor = int(item[1])
+                    decoder.step_index = max(0, min(88, int(item[2])))
+                    resampler.reset()
+                    return True
+                data = item[1] if isinstance(item, tuple) and item and item[0] == "audio" else item
+                if not isinstance(data, (bytes, bytearray)) or not data:
+                    return True
+                raw = bytes(data)
+                frame_size = self._capture_frame_size
+                if len(raw) in (frame_size + 6, 134):
+                    accumulator.reset()
+                    decoder.predictor = struct.unpack(">h", raw[3:5])[0]
+                    decoder.step_index = max(0, min(88, raw[5]))
+                    frames = [raw[6:]]
+                else:
+                    frames = accumulator.append(raw)
+                for frame in frames:
+                    output = resampler.convert(decoder.decode(frame))
+                    if output:
+                        packets.append(struct.pack(f"<{len(output)}h", *output))
+            for packet in packets:
+                q.put_nowait(packet)
+            if packets and not self._live_first_audio_logged:
+                self._live_first_audio_logged = True
+                elapsed = (time.monotonic() - self._live_request_at) * 1000
+                self.log(f"实时延迟 首个PCM +{elapsed:.0f}ms")
+            return True
+        except Exception as exc:
+            self._mark_live_failure(f"音频解码/重采样异常: {exc}")
+            return True
+
+    def _live_write(self, frame: bytes):
+        self._live_process_item(("audio", frame))
+
+    def _live_session(self, generation: int):
+        """短按启动 WeType，实时写 CABLE，STOP 后排空并再次短按提交。"""
+        q = self._live_q
+        drain = self._live_drain
+        pending = bytearray()
+        started_deadline = time.monotonic() + 2.5
+        writer_locked = self._playback_lock.acquire(blocking=False)
+        try:
+            if not writer_locked:
+                self._mark_live_failure("上一段仍在占用 CABLE 写入器")
+                return
+            if not self._ensure_cable_stream():
+                self._mark_live_failure("无法打开 CABLE Input")
+                return
+            self._reset_live_pipeline()
+            self._close_stale_wetype_panel()
+            self._wait_remote_f5_gate()
+            if not self._start_live_provider():
+                self._mark_live_failure("WeType toggle 启动失败")
+                return
+            if not self._wait_wetype_ready():
+                self._mark_live_failure(
+                    f"WeType 语音面板未在 {self._wetype_ready_timeout():.1f} 秒内出现"
+                )
+                return
+            self._live_ready.set()
+            ready_elapsed = (time.monotonic() - self._live_request_at) * 1000
+            self.log(f"WeType 已进入监听 +{ready_elapsed:.0f}ms，开始实时送音")
+
+            # 切换为 direct 模式时持有 order lock：保证面板启动期积压帧
+            # 先于同时到达的新帧进入 decoder/resampler。
+            with self._live_order_lock:
+                prelude, self._live_prelude = self._live_prelude, []
+                for item in prelude:
+                    self._live_process_item(item)
+                self._live_pipeline_ready = True
+
+            block_bytes = max(2, int(self._live_rate * 0.06) * 2)
+            while not self._stop.is_set():
+                if generation != self._live_generation:
+                    self._mark_live_failure("实时会话被新一代覆盖")
+                    break
+                if not self._live_started.is_set() and time.monotonic() >= started_deadline:
+                    self._mark_live_failure("ATVV AUDIO_START 超时")
+                    break
+                try:
+                    packet = q.get(timeout=0.02)
+                    if packet:
+                        pending.extend(packet)
+                except queue.Empty:
+                    pass
+                while len(pending) >= block_bytes:
+                    block = bytes(pending[:block_bytes])
+                    del pending[:block_bytes]
+                    self._cable_stream.write(block)
+                    self._live_bytes_written += len(block)
+                    if not self._live_first_write_logged:
+                        self._live_first_write_logged = True
+                        elapsed = (time.monotonic() - self._live_request_at) * 1000
+                        self.log(f"实时延迟 首次CABLE写入 +{elapsed:.0f}ms")
+                if drain.is_set() and q.empty():
+                    if pending:
+                        block = bytes(pending)
+                        self._cable_stream.write(block)
+                        self._live_bytes_written += len(block)
+                        if not self._live_first_write_logged:
+                            self._live_first_write_logged = True
+                            elapsed = (time.monotonic() - self._live_request_at) * 1000
+                            self.log(f"实时延迟 首次CABLE写入 +{elapsed:.0f}ms")
+                        pending.clear()
+                    break
+
+            if not self._live_failed and self._cable_stream is not None:
+                tail_samples = int(self._live_rate * 0.15)
+                self._cable_stream.write(b"\x00\x00" * tail_samples)
+                time.sleep(0.18)
+        except Exception as exc:
+            self._close_cable_stream()
+            self._mark_live_failure(f"CABLE 实时写入中断: {exc}")
+        finally:
+            self._stop_live_provider("音频已排空" if not self._live_failed else "实时门禁失败")
+            with self._live_order_lock:
+                self._live_pipeline_ready = False
+            if self._live_request_at > 0:
+                elapsed = (time.monotonic() - self._live_request_at) * 1000
+                self.log(f"实时延迟 provider 提交 +{elapsed:.0f}ms")
+            self._live_ready.clear()
+            if generation == self._live_generation:
+                self._live_active = False
+            if writer_locked:
+                self._playback_lock.release()
+            if self._live_failed:
+                self.log(f"实时桥接结束（将回退松手播放）：{self._live_failure_reason}")
+            else:
+                self.log("已送入输入法（实时模式）")
+
+    def _wechat_playback(self, frames: list[bytes], meta: dict | None = None):
+        """松手后播放（v2 回退模式，工作线程）：按住热键 -> 播放缓冲 -> 松开。
+
+        串行互斥：连续两段语音不会并发写 CABLE（并发写触发 AUDCLNT_E_OUT_OF_ORDER）。
+        """
+        if not self._playback_lock.acquire(blocking=False):
+            self.log("(上一段仍在播放，本段丢弃)")
+            return
+        toggle_started = False
+        try:
+            pcm, stats, metrics = self._decode_session(frames, meta)
             if not pcm:
                 self.log("(音频为空)")
                 return
-            dur = len(pcm) / 16000
-            self.log(f"收音 {dur:.1f}s，喂给微信语音…")
-            self._tap_hotkey()          # 开启持续语音（微信开始听 CABLE）
-            time.sleep(0.45)            # 等微信麦克风就绪
-            if not self._open_cable_stream():
-                self._tap_hotkey()      # 开流失败则关掉持续语音
+            diagnostic_path = self._write_capture_diagnostics(frames, pcm, stats, meta or {})
+            message = (
+                f"收音 {metrics['duration']:.1f}s / {stats['notifications']}包 / "
+                f"{stats['raw_bytes']}B，RMS={metrics['rms']:.0f} "
+                f"peak={metrics['peak']} sync={stats['sync_count']}，喂给微信语音…"
+            )
+            self.log(message)
+            if diagnostic_path is not None:
+                self.log(f"诊断 WAV: {diagnostic_path}")
+            if self.live:
+                toggle_started = self._tap_hotkey(80)
+                if not toggle_started:
+                    self.log("微信回退播放失败: WeType toggle 启动失败")
+                    return
+            else:
+                self._press_hotkey(down=True)  # 稳定版松手播放保持原按住式配置
+            time.sleep(0.45)                 # 等输入法麦克风就绪
+            if not self._ensure_cable_stream():
+                if toggle_started:
+                    self._tap_hotkey(80)
+                    toggle_started = False
+                else:
+                    self._press_hotkey(down=False)
                 return
             # 重采样并播放
             import struct as _s
@@ -788,18 +1655,28 @@ class VoiceDaemon:
                            else int(cur + (nxt - cur) * fr))
                 prev = float(cur)
             self._cable_stream.write(_s.pack(f"<{len(out)}h", *out))
-            time.sleep(0.35)            # 尾音播完
-            self._tap_hotkey()          # 结束持续语音 -> 微信识别上屏
-            self._close_cable_stream()
+            time.sleep(0.35)                 # 尾音播完
+            if toggle_started:
+                self._tap_hotkey(80)
+                toggle_started = False
+            else:
+                self._press_hotkey(down=False)  # 松开 -> 输入法识别上屏
             self.log("已交由微信识别（去语气词/整理）")
         except Exception as e:
             import traceback
             self.log(f"微信播放管线异常: {e}\n{traceback.format_exc()}")
             try:
-                self._tap_hotkey()      # 异常时尽力关闭持续语音
-                self._close_cable_stream()
+                if toggle_started:
+                    self._tap_hotkey(80)
+                    toggle_started = False
+                else:
+                    self._press_hotkey(down=False)   # 异常时尽力松开热键
+                if self._cable_stream is None:
+                    pass  # 常开流：仅在写失败时已置空，无需处理
             except Exception:
                 pass
+        finally:
+            self._playback_lock.release()
 
     def _close_cable_stream(self):
         st = getattr(self, "_cable_stream", None)
@@ -810,6 +1687,16 @@ class VoiceDaemon:
             except Exception:
                 pass
             self._cable_stream = None
+
+    def _ensure_cable_stream(self):
+        """CABLE 输出流常开复用（服务生命周期内不关，写失败自动置空重开）。
+
+        每段会话开关流曾在 WASAPI/PortAudio 路径触发堆损坏（2026-08-28
+        两份崩溃 dump 定位），改为常开后同时省掉每段 ~50ms 的开流延迟。
+        """
+        if getattr(self, "_cable_stream", None) is not None:
+            return True
+        return self._open_cable_stream()
 
     # ---- 微信模式流式桥接 ----
     def _find_cable_input(self):
@@ -827,11 +1714,7 @@ class VoiceDaemon:
         return (two_ch or candidates)[0][0]
 
     def _open_cable_stream(self):
-        """打开 CABLE 输出流并重置解码器（每段录音开始时调用）。
-
-        CABLE 设备跑在 44.1/48kHz，遥控器音频是 16kHz，
-        打开时记录采样率并在 _live_write 里线性插值重采样。
-        """
+        """打开并常驻复用 CABLE 输出流；每段 codec 状态另行重置。"""
         try:
             import sounddevice as sd
             idx = self._find_cable_input()
@@ -840,9 +1723,7 @@ class VoiceDaemon:
                 return False
             dev = sd.query_devices(idx)
             rate = int(dev["default_samplerate"])
-            self._live_decoder = ImaAdpcmDecoder()
             self._live_rate = rate
-            self._live_last = 0.0  # 上一帧末样本（重采样跨帧连续）
             self._cable_stream = sd.RawOutputStream(
                 device=idx, samplerate=rate, channels=1, dtype="int16",
                 blocksize=0,

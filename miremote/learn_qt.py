@@ -34,7 +34,7 @@ class LearnDialog(QtWidgets.QDialog):
 
         self.name_box = QtWidgets.QComboBox()
         self.name_box.addItems(["返回", "主页", "菜单", "TV", "电源", "语音",
-                                "音量+", "音量-", "静音"])
+                                "音量+", "音量-"])
         lay.addWidget(self.name_box)
 
         self.lbl = QtWidgets.QLabel("等待按遥控器…")

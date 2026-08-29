@@ -81,11 +81,17 @@ adjust volume.
 | 功能 | 说明 |
 |---|---|
 | 按键捕获 | 方向/OK/主页/菜单/TV/电源/语音键，Raw Input 按设备过滤（不影响物理键盘） |
-| **哑键救回** | **返回/音量±的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（macOS 项目也没有的能力） |
+| **哑键救回** | **返回/音量±的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（tap4 协议：并发连接防护 + 控制握手，macOS 项目也没有的能力） |
 | 本地语音 | 按住说话→松手→ATVV 蓝牙协议解码→faster-whisper 本地转写→文字粘贴（全离线） |
-| 微信语音模式 | 声音桥接给微信输入法识别（自动去语气词、整理语句） |
+| 微信语音模式 | 松手后整段音频桥接给微信输入法识别（自动去语气词、整理语句）；需 VB-CABLE + 在微信输入法里把语音麦克风设为 CABLE Output、"按住说话"快捷键设为 Ctrl+Alt+V |
 | Qt GUI | 按键映射可视化编辑（点遥控器图绑键）+ 语音模式切换 + 日志 + 系统托盘 |
+| 回归测试 | 27 项 pytest 覆盖哑键协议解析/Gadget 版本协商/语音链路（`tests/`） |
 | 开机自启 | 静默后台启动 + 自动启动守护 |
+
+> 状态：2026-08-29 tap4 稳定版。语音链路大坑已修（会话开始**不再主动发
+> MIC_OPEN**——固件 2671 上主动开麦会触发一条无声的"主机流"，把按住语音键
+> 的真实物理流堵死，表现为每段固定 1.9 秒无效音频）；MIC_CLOSE 后音频通知
+> 失效也已按言灵的 REOPEN RESET 序列修复。
 
 ## 它是怎么工作的
 
@@ -102,9 +108,11 @@ adjust volume.
 - **哑键机制**：返回键 usage=0xF1、音量=0x80/0x81，HidOverGatt 驱动收到报文但
   翻译不成键盘事件直接丢弃；frida-gadget DLL（官方发布物，双 SHA-256 锁定）
   注入 WUDFHost 钩 `NtDeviceIoControlFile` 取回报文
-- **微信桥接的架构教训**：遥控器语音键=F5 透传，按住期间注入热键会被微信的
-  组合键检测干扰——最终采用"录音期间零注入缓冲 + 松手后短击切换式热键 +
-  播放到 VB-CABLE"的架构
+- **微信桥接的架构教训**：遥控器语音键=F5 透传，按住期间注入热键会被微信
+  输入法的"防误触"拒绝（它只认硬件按键状态，注入的假松开骗不过）。最终采用
+  **松手播放**架构：录音期间零注入缓冲 → 松手后按住 Ctrl+Alt+V（微信输入法
+  "按住说话"快捷键）→ 整段音频播放进 VB-CABLE → 松开 → 输入法识别上屏。
+  想做"按下实时出字"？两条硬约束卡死，详见下面踩坑记录的新增章节
 
 ## 快速开始
 
@@ -206,6 +214,42 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 （实测过把笔记本 Enter 改写成空格的惨案）。本项目按键引擎走 **Raw Input 按设备
 过滤**（VID 2717/PID 32B8），笔记本键盘事件根本进不了分发，这是架构上免疫。
 
+### 二轮攻坚新增坑（2026-08-28/29，语音桥接与实时输入）
+
+- **主动 MIC_OPEN 会堵死物理流**：会话开始就发 `0C 00` 开麦，在固件 2671 上
+  会打开一条无声的"主机流"，与按住语音键触发的物理流互斥——症状是每段录音
+  固定收到约 1.9 秒与说话内容无关的帧。修复：**绝不在 begin 时主动开麦**，
+  只被动收物理流（言灵源码 `physical_stream_must_release_before_host_open`
+  印证）。注意别和另一个坑搞混：完全不响应固件的 `0x08` 开麦请求也不行，
+  响应式开麦（收到请求才回 `0C 00`）是必要的
+- **MIC_CLOSE 后音频通知订阅悄悄失效**：第二段起收不到任何帧。修复=按言灵
+  REOPEN RESET 序列重订阅（取消订阅 → CCCD=None → 停 180ms → 重新 NOTIFY）
+- **PortAudio/WASAPI 堆损坏（0xc0000374 连崩）**：15ms 小块高频 write +
+  每段会话开关流会踩崩 libportaudio。修复=虚拟声卡流**常开** + ~60ms 批量
+  大块写
+- **AUDCLNT_E_OUT_OF_ORDER**：多个线程并发写同一条 CABLE 流触发。播放必须
+  互斥（含"上一段没播完就丢弃下一段"的兜底）
+- **微信输入法防误触只认硬件按键**：只要有真实硬件键处于按下状态（比如按住
+  的语音键 F5），它就拒绝响应热键；SendInput 注入的按键不会触发防误触，
+  但注入"假松开"也清不掉它。这意味着**"按住语音键的同时唤起输入法"在热键
+  路径上被物理堵死**
+- **本机 LL 钩子先于 Raw Input 分发**（实测快约 1.2ms），且钩子里吞掉的键
+  Raw Input 也收不到——"在低层钩子吞 F5"会直接饿死依赖 Raw Input 的语音
+  触发。要做设备区分只能把触发源一起搬进钩子层（参考 `miremote/llhook.py`）
+- **PyInstaller 错收 Qt DLL**：某些桌面软件会把自有运行时目录塞进 PATH，
+  打包时被错收导致 `ImportError: DLL load failed ... QtCore`。spec 里按
+  关键字剔除污染的 PATH 条目（见 `miremote.spec`）
+
+### 实时输入（按下即出字）：已尝试、暂未攻克
+
+两个 AI Agent 各自独立攻了两天，全部路线汇总失败。核心死结是两条物理约束
+的交集：**遥控器固件只在语音键按住期间才发音频流** × **输入法在硬件键按住
+期间拒绝热键**——想在"按住期间"唤起输入法，热键路径走不通；Gadget 报文
+级抹除 F5、低层钩子吞键、80ms 切换式热键、pre-roll 缓冲等都试过，输入法
+面板在按住期间始终不稳定出现。源码里保留了整套 dormant 实验实现（环境变量
+`MIREMOTE_REALTIME_DEV=1` 启用，正式包不启用），`tools/` 里有三个诊断探针。
+细节档案（两边的完整尝试清单）见作者博客/交接文档，欢迎带着新思路来挑战。
+
 ### 更多
 
 完整坑清单和调试方法论见 [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md) §5-§7，
@@ -215,6 +259,8 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 
 - 返回键拦截需要 UAC 提权（开机自启场景会弹窗，计划任务方案可规避，见 roadmap）
 - 语音键/方向键透传有副作用（焦点在浏览器时 F5=刷新）
+- 微信语音模式是"松手后出字"（约 0.45s + 说话时长 + 0.35s 的固有延迟）；
+  "按下实时出字"两个 Agent 攻了两天未攻克，原因见上面踩坑记录
 - 只在 RC003（固件 2671）+ 一台 RTX 4060 机器上验证过
 - 转写准确率：whisper medium 约 90%+，说"登录"偶尔变"灯露"
 
@@ -223,7 +269,11 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 - [ ] 开机自启 UAC 优化（计划任务以最高权限运行）
 - [ ] FunASR/SenseVoice 替换 whisper（中文 CER 约一半、快 12 倍）
 - [ ] 语音子进程常驻池（降低松手→出字延迟）
-- [ ] 连续听写（松手不断流）：主机流 start_reason=0x00 + 每 8 秒 `MIC_EXTEND [0x0E, streamId]` 心跳 + generation/session 双重校验——完整参考实现见下面言灵项目的 `VibeMicAtvvCapture.cs`
+- [x] ~~连续听写（松手不断流）~~ → **已尝试未攻克**（2026-08，两个 Agent
+      独立攻坚）：固件侧主机流（start_reason=0x00）在本机 2671 上无音频且与
+      物理流互斥；输入法侧"按住说话"热键被防误触拒绝。完整失败档案与 dormant
+      代码（`MIREMOTE_REALTIME_DEV`）在仓库内，欢迎新思路。协议参考仍推荐
+      言灵的 `VibeMicAtvvCapture.cs`
 - [ ] 多遥控器/其他型号支持（需 learn 模式采集 usage 表）
 
 ## 致谢与许可
@@ -272,11 +322,19 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 | Feature | Notes |
 |---|---|
 | Button capture | D-pad / OK / Home / Menu / TV / Power / Voice via Raw Input, filtered by device (physical keyboard untouched) |
-| **Dead-key recovery** | **Back / Volume± HID reports are silently dropped by the Windows driver** — this project recovers them by injecting a Frida Gadget into WUDFHost (not even the macOS projects do this) |
+| **Dead-key recovery** | **Back / Volume± HID reports are silently dropped by the Windows driver** — recovered by injecting a Frida Gadget into WUDFHost (tap4 protocol: concurrent-connection guard + control handshake; not even the macOS projects do this) |
 | Local voice | Hold-to-talk → release → ATVV Bluetooth decode → faster-whisper local transcription → paste (fully offline) |
-| WeChat voice mode | Audio bridged to WeType IME recognition (auto-removes filler words, polishes sentences) |
+| WeChat voice mode | After release, the whole utterance is bridged to WeType IME recognition (auto-removes filler words); requires VB-CABLE, WeType mic set to CABLE Output, and WeType's hold-to-talk hotkey set to Ctrl+Alt+V |
 | Qt GUI | Visual key remapping (click the remote picture) + voice mode switch + log + system tray |
+| Regression tests | 27 pytest cases covering the dead-key protocol / Gadget version negotiation / voice chain (`tests/`) |
 | Boot autostart | Silent background start + service auto-launch |
+
+> Status: tap4 stable, 2026-08-29. The big voice-chain bug is fixed: sessions
+> **no longer send MIC_OPEN proactively** — on firmware 2671 a proactive
+> opens a silent "host stream" that blocks the real physical stream (symptom:
+> every utterance was a fixed ~1.9 s of useless audio). The post-MIC_CLOSE
+> audio-notify subscription loss is fixed too, via vibe-flow's REOPEN RESET
+> sequence.
 
 ## How It Works
 
@@ -298,10 +356,13 @@ Key technical details:
   pinned) is injected into WUDFHost to hook `NtDeviceIoControlFile` and
   recover the reports.
 - **Architecture lesson from the WeChat bridge**: the remote's voice key
-  passes through as F5, and holding it interferes with WeChat's hotkey
-  detection. The final design buffers audio with zero injection while
-  recording, then uses a toggle-style hotkey tap after release, followed by
-  playback into VB-CABLE.
+  passes through as F5, and WeType's anti-mistouch logic **rejects hotkeys
+  while any real hardware key is held** (injected keys don't trigger the
+  guard, but a fake "release" can't clear it either). The final design is
+  release-playback: zero injection while recording → after release, hold
+  Ctrl+Alt+V (WeType's hold-to-talk hotkey) → play the utterance into
+  VB-CABLE → release → WeType types the text. Want press-to-text in real
+  time? Two hard constraints block it — see the new pitfalls section below.
 
 ## Quick Start
 
@@ -422,6 +483,53 @@ Enter turning into Space). This project's key engine runs on **Raw Input with
 per-device filtering** (VID 2717/PID 32B8): laptop keyboard events never enter
 the dispatch. Architectural immunity.
 
+### Round-two pitfalls (2026-08-28/29, WeChat bridge & realtime input)
+
+- **Proactive MIC_OPEN blocks the physical stream**: sending `0C 00` at session
+  start opens a silent "host stream" on firmware 2671 that is mutually
+  exclusive with the physical stream — every utterance arrived as a fixed
+  ~1.9 s of frames unrelated to speech. Fix: **never open the mic proactively
+  in `begin`**; consume the physical stream passively (vibe-flow's
+  `physical_stream_must_release_before_host_open` confirms the exclusivity).
+  Don't overcorrect: you DO still need to answer the firmware's `0x08` mic
+  request — reactive open, not proactive, not none.
+- **Audio-notify subscription silently dies after MIC_CLOSE**: from the second
+  utterance on, no frames arrive. Fix: resubscribe per vibe-flow's REOPEN
+  RESET (unsubscribe → CCCD=None → wait 180 ms → re-notify).
+- **PortAudio/WASAPI heap corruption (0xc0000374, twice)**: 15 ms high-frequency
+  small writes plus per-session stream open/close crashes libportaudio. Fix:
+  keep the virtual-cable stream **open for the process lifetime** and write in
+  ~60 ms batches.
+- **AUDCLNT_E_OUT_OF_ORDER**: two threads writing the same CABLE stream.
+  Playback must be serialized (drop the new utterance if the previous one is
+  still playing).
+- **WeType anti-mistouch only looks at hardware keys**: with any real hardware
+  key held (e.g. the voice key = F5), WeType refuses hotkeys. SendInput keys
+  don't trip the guard, but an injected fake "release" can't clear it either.
+  So **waking the IME while holding the voice key is physically blocked on the
+  hotkey path**.
+- **On this machine the LL hook fires BEFORE Raw Input** (~1.2 ms earlier,
+  measured), and a key swallowed in the LL hook never reaches Raw Input —
+  swallowing F5 in a low-level hook starves any Raw-Input-based voice trigger.
+  Device discrimination then requires moving the trigger into the hook layer
+  itself (see `miremote/llhook.py`).
+- **PyInstaller picking up wrong Qt DLLs**: some desktop apps put their own
+  runtime dirs on PATH; the packager collects their DLLs and Qt breaks with
+  `ImportError: DLL load failed ... QtCore`. Filter polluted PATH entries in
+  the spec (see `miremote.spec`).
+
+### Realtime input (press-to-text): attempted, not solved
+
+Two AI agents attacked this independently for two days; every route failed.
+The core deadlock is the intersection of two physical constraints: **the
+firmware only streams audio while the voice key is held** × **the IME rejects
+hotkeys while a hardware key is held**. Gadget-level report suppression,
+LL-hook swallowing, an 80 ms toggle hotkey, and pre-roll buffering were all
+tried — the IME panel never appeared reliably during the hold. The full
+dormant experimental implementation is preserved in the source (enable with
+`MIREMOTE_REALTIME_DEV=1`; release builds don't) together with three
+diagnostic probes under `tools/`.
+
 ### More
 
 Full pitfall list and debugging methodology in
@@ -433,6 +541,9 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 - Dead-key recovery requires UAC elevation (a dialog appears on boot;
   a scheduled-task approach can avoid it — see roadmap)
 - Voice/d-pad keys pass through with side effects (F5 refreshes a focused browser)
+- WeChat voice mode is release-to-text (~0.45 s + utterance length + 0.35 s
+  inherent latency); press-to-text realtime was attacked by two agents for two
+  days and remains unsolved — see the pitfalls section above
 - Only verified on RC003 (firmware 2671) + one RTX 4060 laptop
 - Transcription accuracy: whisper medium ≈ 90%+; "登录" (login) occasionally
   becomes "灯露"
@@ -442,10 +553,13 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 - [ ] Boot autostart without UAC prompt (scheduled task with highest privileges)
 - [ ] Replace whisper with FunASR/SenseVoice (half the CER, 12× faster for Chinese)
 - [ ] Persistent transcription worker pool (lower release-to-text latency)
-- [ ] Continuous dictation (no stream break on release): host-owned stream with
-      start_reason=0x00 + 8-second `MIC_EXTEND [0x0E, streamId]` heartbeats +
-      generation/session double-checking — see vibe-flow's `VibeMicAtvvCapture.cs`
-      (linked below) for a complete reference implementation
+- [x] ~~Continuous dictation (no stream break on release)~~ → **attempted,
+      unsolved** (2026-08, two independent agents): on this 2671 unit the
+      host-owned stream (start_reason=0x00) carries no audio and is mutually
+      exclusive with the physical stream; on the IME side the hold-to-talk
+      hotkey is blocked by anti-mistouch. Failure archive and dormant code
+      (`MIREMOTE_REALTIME_DEV`) are in the repo — new ideas welcome. For
+      protocol reference still see vibe-flow's `VibeMicAtvvCapture.cs`
 - [ ] Support more remotes (requires usage-table collection via learn mode)
 
 ## Credits & License

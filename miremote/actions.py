@@ -53,7 +53,7 @@ def _tap(vk: int, up: bool = False):
     inp.type = INPUT_KEYBOARD
     inp.union.ki.wVk = vk
     inp.union.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
-    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
 
 
 def send_combo(names: list[str], hold_last_ms: int = 30):
@@ -162,6 +162,15 @@ def find_windows(title_regex: str) -> list[tuple[int, str]]:
 
     user32.EnumWindows(cb, 0)
     return found
+
+
+def close_windows(title_regex: str) -> int:
+    """向匹配的可见顶层窗口发送 WM_CLOSE，返回成功发送数量。"""
+    closed = 0
+    for hwnd, _title in find_windows(title_regex):
+        if user32.PostMessageW(hwnd, 0x0010, 0, 0):
+            closed += 1
+    return closed
 
 
 def focus_window(title_regex: str) -> bool:
