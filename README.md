@@ -57,6 +57,7 @@ adjust volume.
 - [功能一览](#功能一览全部真机验证)
 - [它是怎么工作的](#它是怎么工作的)
 - [快速开始](#快速开始)
+- [键位配置 v2](#键位配置-v2三手势--连发)
 - [踩坑记录](#踩坑记录本文档最有价值的部分)
 - [已知限制](#已知限制)
 - [Roadmap](#roadmap想折腾的方向)
@@ -67,6 +68,7 @@ adjust volume.
 - [Features](#features-verified-on-real-hardware)
 - [How It Works](#how-it-works)
 - [Quick Start](#quick-start)
+- [Key Configuration v2](#key-configuration-v2--three-gestures--hold-to-repeat)
 - [Pitfalls Log](#pitfalls-log-the-most-valuable-part-of-this-doc)
 - [Known Limitations](#known-limitations)
 - [Roadmap](#roadmap-ideas-if-you-want-to-hack-on-it)
@@ -101,7 +103,7 @@ adjust volume.
 ## 它是怎么工作的
 
 ```
-① 按键：遥控器 HID → Raw Input（VID/PID 过滤）→ 动作系统（SendInput/剪贴板/…）
+① 按键：遥控器 HID → Raw Input（VID/PID 过滤）→ 手势引擎（三手势/按住连发）→ 动作系统（SendInput/剪贴板/语义动作/…）
 ② 语音：遥控器 ATVV(GATT) → ADPCM 解码 → whisper 转写（本地）或 CABLE 桥接（微信）
 ③ 哑键：WUDFHost 内 Gadget 钩子 → localhost:30685 → 解码成按键边沿
 ```
@@ -143,6 +145,37 @@ curl -L -o assets\frida-gadget-17.15.3-windows-x86_64.dll.xz ^
 
 pyinstaller miremote.spec --noconfirm
 ```
+
+## 键位配置 v2（三手势 + 连发）
+
+每个键有三个独立手势槽；老配置里的 `on_down` 会自动迁移成「单击」槽，保存时双写兼容：
+
+```json
+"VK_HOME": {
+  "label": "主页",
+  "click":        { "type": "tap", "key": "VK_RETURN" },
+  "double_click": { "type": "none" },
+  "long_press":   { "type": "keys", "combo": ["VK_CONTROL", "VK_Z"] },
+  "repeat": true,
+  "repeat_delay": 350,
+  "repeat_interval": 100
+}
+```
+
+- **判定规则**：没配双击/长按的键**按下立即触发**（零延迟）；配了双击，单击延迟
+  300ms 等第二击；配了长按，按住 550ms 触发（且按住期间持续连发）。语音键固定
+  为"按住说话"，不参与手势判定
+- **按住连发**：`tap`/`volume` 类动作按住自动连发（首延迟 350ms + 间隔 100ms，
+  用 `repeat_delay`/`repeat_interval` 毫秒可调，返回键想要飞快可设 50）；
+  组合键类默认不连发，`"repeat": true` 显式开启，`"repeat": false` 显式关闭
+- **动作类型**：`none / tap / keys / volume / type / run / focus /
+  focus_then_keys / voice`，以及语义动作 `show_desktop / context_menu /
+  app_switcher / play_pause / media_next / media_prev / open_app`
+  （全部可在 GUI 动作下拉里直接选）
+- **open_app 三级解析**：窗口标题命中 → 聚焦前台；否则注册表 App Paths →
+  开始菜单快捷方式 → PATH 兜底
+- **选配泄漏抑制**：键位条目加 `"suppress_leak": true` 可拦掉该键漏进焦点
+  应用的物理事件（只拦遥控器来源，笔记本同键不受影响；语音键不适用）
 
 ## 踩坑记录（本文档最有价值的部分）
 
@@ -263,7 +296,8 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 ## 已知限制
 
 - 返回键拦截需要 UAC 提权（开机自启场景会弹窗，计划任务方案可规避，见 roadmap）
-- 语音键/方向键透传有副作用（焦点在浏览器时 F5=刷新）
+- 语音键/方向键透传有副作用（焦点在浏览器时 F5=刷新）；普通键可在配置里加
+  `suppress_leak: true` 拦截，语音键不适用
 - 微信语音模式是"松手后出字"（约 0.45s + 说话时长 + 0.35s 的固有延迟）；
   "按下实时出字"两个 Agent 攻了两天未攻克，原因见上面踩坑记录
 - 只在 RC003（固件 2671）+ 一台 RTX 4060 机器上验证过
@@ -358,7 +392,7 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 ## How It Works
 
 ```
-① Buttons: remote HID → Raw Input (VID/PID filter) → action system (SendInput/clipboard/…)
+① Buttons: remote HID → Raw Input (VID/PID filter) → gesture engine (three gestures / hold-to-repeat) → action system (SendInput/clipboard/semantic actions/…)
 ② Voice:   remote ATVV (GATT) → ADPCM decode → whisper (local) or CABLE bridge (WeChat)
 ③ Dead keys: Gadget hook inside WUDFHost → localhost:30685 → decoded key edges
 ```
@@ -407,6 +441,41 @@ curl -L -o assets\frida-gadget-17.15.3-windows-x86_64.dll.xz ^
 
 pyinstaller miremote.spec --noconfirm
 ```
+
+## Key Configuration v2 (three gestures + hold-to-repeat)
+
+Each key has three independent gesture slots; a legacy `on_down` migrates to
+the click slot automatically and is kept as a compat mirror on save:
+
+```json
+"VK_HOME": {
+  "label": "Home",
+  "click":        { "type": "tap", "key": "VK_RETURN" },
+  "double_click": { "type": "none" },
+  "long_press":   { "type": "keys", "combo": ["VK_CONTROL", "VK_Z"] },
+  "repeat": true,
+  "repeat_delay": 350,
+  "repeat_interval": 100
+}
+```
+
+- **Timing rules**: keys without double/long configured **fire immediately on
+  press** (zero latency); a configured double holds the single for 300 ms;
+  long-press fires at 550 ms and keeps repeating while held. The voice key is
+  fixed to hold-to-talk and never enters the gesture engine.
+- **Hold-to-repeat**: `tap`/`volume` actions auto-repeat while held
+  (350 ms initial delay + 100 ms cadence, tunable via `repeat_delay`/
+  `repeat_interval` in milliseconds — use 50 for a fast backspace);
+  combo (`keys`) actions opt in with `"repeat": true`, and `"repeat": false`
+  explicitly disables it.
+- **Action types**: `none / tap / keys / volume / type / run / focus /
+  focus_then_keys / voice`, plus semantic `show_desktop / context_menu /
+  app_switcher / play_pause / media_next / media_prev / open_app`
+  (all available in the GUI action dropdown).
+- **open_app resolution**: window title match → focus; otherwise registry
+  App Paths → Start-Menu shortcut → PATH.
+- **Optional leak suppression**: `"suppress_leak": true` swallows the key's
+  leaked physical event (remote-origin only; not applicable to the voice key).
 
 ## Pitfalls Log (the most valuable part of this doc)
 
@@ -559,7 +628,9 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 
 - Dead-key recovery requires UAC elevation (a dialog appears on boot;
   a scheduled-task approach can avoid it — see roadmap)
-- Voice/d-pad keys pass through with side effects (F5 refreshes a focused browser)
+- Voice/d-pad keys pass through with side effects (F5 refreshes a focused
+  browser); ordinary keys can set `suppress_leak: true` in config — not
+  applicable to the voice key
 - WeChat voice mode is release-to-text (~0.45 s + utterance length + 0.35 s
   inherent latency); press-to-text realtime was attacked by two agents for two
   days and remains unsolved — see the pitfalls section above
