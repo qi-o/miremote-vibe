@@ -69,6 +69,9 @@ a = Analysis(
         'miremote.diagnose',
         'miremote.remote_widget',
         'miremote.learn_qt',
+        # 三手势引擎与泄漏抑制(2026-09 键位系统)
+        'miremote.gestures',
+        'miremote.leaksup',
     ],
     hookspath=[],
     hooksconfig={},

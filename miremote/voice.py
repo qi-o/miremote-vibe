@@ -827,6 +827,9 @@ class VoiceDaemon:
                  addr: int = DEFAULT_ADDR, mode: str = "local",
                  wechat_hotkey: str | None = None,
                  live: bool = True, ready_delay: float = 0.45,
+                 live2: bool = False,
+                 toggle_hotkey: list[str] | None = None,
+                 arm_suppression=None,
                  diagnostics: bool = False,
                  diagnostics_root: Path | None = None):
         self.on_text = on_text      # callable(text: str)
@@ -837,6 +840,14 @@ class VoiceDaemon:
         self.wechat_hotkey = wechat_hotkey  # 微信模式：触发输入法语音的组合键名列表
         self.live = live            # 微信模式 v3：按下即实时送音（False=松手后整段播放）
         self.ready_delay = ready_delay  # 实时模式：面板开启热键后等输入法就绪的秒数
+        # live2（2026-08-29 时序错位路线）：切换式面板预开复用 + 按住期间零热键
+        # 注入 + 松手后慢速 toggle 关闭 + 剪贴板收割 + Ctrl+V 粘贴上屏。
+        # 全部环节 8-29 实测验证（面板检测/慢速节奏/剪贴板路径）。
+        self.live2 = live2
+        self.toggle_hotkey = toggle_hotkey or ["VK_CONTROL", "VK_LWIN", "VK_SHIFT"]
+        self.arm_suppression = arm_suppression  # callable() -> bool：ATVV 开流时
+        # 触发 Gadget 重学习窗口（处理蓝牙重连后的句柄/通道变化）
+        self._clip_before: str | None = None  # 会话开始时的剪贴板快照
         self.diagnostics = diagnostics
         self.diagnostics_root = diagnostics_root
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -850,6 +861,7 @@ class VoiceDaemon:
         self._live_started = threading.Event()
         self._live_ready = threading.Event()
         self._live_active = False                       # 实时会话线程存活标记
+        self._live_armed = False                        # 本段实时会话是否成功武装
         self._live_thread: threading.Thread | None = None
         self._live_fallback_needed = False
         self._live_bytes_written = 0
@@ -884,9 +896,17 @@ class VoiceDaemon:
         self._live_drain.set()
         self._live_started.set()
         self._stop_live_provider("守护停止")
+        if self._live2_panel_cleanup_needed():
+            try:
+                self._tap_toggle_slow()
+            except Exception:
+                pass
         if self._thread:
             self._thread.join(timeout=5)
         self._close_cable_stream()  # 常开流随守护退出统一关闭
+
+    def _live2_panel_cleanup_needed(self) -> bool:
+        return bool(self.live2 and self.mode == "wechat" and self._wetype_panel_visible())
 
     @property
     def ready(self) -> bool:
@@ -925,6 +945,9 @@ class VoiceDaemon:
                 cli.on_stream_stop_live = self._on_atvv_stream_stop
                 cli.on_codec_sync_live = self._on_atvv_codec_sync
                 self._ready.set()
+                # live2 不预开面板：切换式语音会话激活会切系统通信模式、
+                # 静音其他声音流（用户实测看视频无声）——面板必须用完即关，
+                # 每段在按下瞬间现开（F5 已被 LL 钩子吞，防误触不触发）。
                 while not self._stop.is_set():
                     if not self._collecting:
                         # 空闲：等 begin 命令（on_voice / rawinput 兜底 / 帧自检）
@@ -997,7 +1020,10 @@ class VoiceDaemon:
             return
         if data[0] in (OP_START_SEARCH_V1, OP_START_SEARCH):
             self.log("ATVV START_SEARCH，响应 MIC_OPEN")
-            if self.mode == "wechat" and self.live:
+            # live2 不提前 prepare：与 begin 的 prepare 双触发会在快速连按
+            # 时互相打架（旧会话未清 → 新会话被守卫挡掉 → 该段音频全丢），
+            # 统一由 begin 单点启动
+            if self.mode == "wechat" and self.live and not self.live2:
                 self._live_request_at = time.monotonic()
                 self._put("prepare_live")
         elif data[0] == OP_MIC_OPEN and len(data) >= 3:
@@ -1016,6 +1042,11 @@ class VoiceDaemon:
         if self.mode == "wechat" and self.live and self._live_request_at > 0:
             elapsed = (time.monotonic() - self._live_request_at) * 1000
             self.log(f"实时延迟 AUDIO_START +{elapsed:.0f}ms")
+        if self.live2 and self.arm_suppression is not None:
+            try:
+                self.arm_suppression()
+            except Exception:
+                pass
         if not self._collecting and time.monotonic() - self._last_session_end > 0.5:
             self.log("检测到语音流，开始会话…")
             self.begin()
@@ -1047,26 +1078,30 @@ class VoiceDaemon:
                     self._live_prelude.append(item)
 
     def _on_atvv_frame(self, frame: bytes):
-        """音频帧到达：更新活动时间戳；v3 live 模式空闲时自检开会话。"""
+        """音频帧到达：更新活动时间戳；live 模式空闲时自检开会话。"""
         self._atvv_last = time.monotonic()
+        item = ("audio", frame)
         if self._collecting:
             if self._live_q is not None:
-                item = ("audio", frame)
                 with self._live_order_lock:
                     if not self._live_pipeline_ready or not self._live_process_item(item):
-                        # 流未就绪窗口（tap/开流期间）的帧先进 prelude
                         self._live_prelude.append(item)
+            else:
+                # 实时管道未建好（正在启动/等锁）：帧进 prelude 绝不丢
+                with self._live_order_lock:
+                    self._live_prelude.append(item)
             return
         # v2（松手播放）模式：会话完全由 rawinput 的 F5 down/up 驱动，
         # 帧只在上面的 collecting 分支缓冲，绝不自检触发 begin——否则与
         # F5 触发交叠产生并发会话、并发写 CABLE（AUDCLNT_E_OUT_OF_ORDER）。
         if not self.live:
             return
-        if time.monotonic() - self._last_session_end > 0.5:
+        # 0.3s 防抖：只挡上一段 stop 后的迟到尾包，不挡正常的连按
+        if time.monotonic() - self._last_session_end > 0.3:
             if not self._live_prelude:
                 self.log("检测到语音流，开始会话…")
             with self._live_order_lock:
-                self._live_prelude.append(("audio", frame))
+                self._live_prelude.append(item)
             self.begin()
 
     def atvv_recent(self, within_ms: float = 250.0) -> bool:
@@ -1092,9 +1127,14 @@ class VoiceDaemon:
         return False
 
     # ---- 会话生命周期 ----
-    async def _prepare_live_session(self, _cli):
-        if self.mode != "wechat" or not self.live or self._live_active:
-            return
+    async def _prepare_live_session(self, _cli) -> bool:
+        """启动本段实时会话线程（不等待/不阻塞主循环）。
+
+        旧会话未退出时不等待：递增 generation 让旧线程自退（其循环会检测
+        代际不匹配并让位，面板留给新段）；新线程在 playback_lock 上限时
+        等待旧线程释放（等待期间本段帧全部安全进 prelude）。"""
+        if self.mode != "wechat" or not self.live:
+            return False
         self._capture_frame_size = _cli.frame_size
         self._live_generation += 1
         generation = self._live_generation
@@ -1108,9 +1148,15 @@ class VoiceDaemon:
         self._live_bytes_written = 0
         self._live_first_audio_logged = False
         self._live_first_write_logged = False
-        if self._live_request_at <= 0:
-            self._live_request_at = time.monotonic()
+        self._live_request_at = time.monotonic()
         self._live_fallback_capture = None
+        if self.live2:
+            # 剪贴板快照：结束后收割"与快照不同的新文本"（切换式提交路径）
+            try:
+                from . import actions as _act
+                self._clip_before = _act.get_clipboard_text()
+            except Exception:
+                self._clip_before = None
         self._live_active = True
         with self._live_lock:
             self._live_decoder = None
@@ -1125,6 +1171,7 @@ class VoiceDaemon:
             name="voice-live",
         )
         self._live_thread.start()
+        return True
 
     async def _begin_session(self, cli):
         if self._collecting:
@@ -1155,9 +1202,10 @@ class VoiceDaemon:
         # RC003 的 START_SEARCH 响应由 AtvvClient 处理；会话 begin 只负责
         # 建立本地收集边界，绝不能再次主动 MIC_OPEN。
         if self.mode == "wechat" and self.live:
-            await self._prepare_live_session(cli)
+            self._live_armed = await self._prepare_live_session(cli)
             self._live_started.set()
-            self.log("录音中…（实时送入输入法，松手出字）")
+            self.log("录音中…（实时送入输入法，松手出字）" if self._live_armed
+                     else "录音中…（实时未就绪，本段将回退松手播放）")
         else:
             self.log("录音中…（按住说话）")
             # local 模式帧全在 cli.audio_frames（含 prelude 时期的帧）
@@ -1198,19 +1246,29 @@ class VoiceDaemon:
             if self.live:
                 # v4 实时：AUDIO_STOP 后尾包/队列排干，再松开热键。
                 live_thread = getattr(self, "_live_thread", None)
-                if live_thread is not None and live_thread.is_alive():
+                if not self.live2 and live_thread is not None and live_thread.is_alive():
                     await asyncio.to_thread(live_thread.join, 1.5)
-                if live_thread is not None and live_thread.is_alive():
-                    self._mark_live_failure("实时队列 1.5 秒内未排空")
-                    self._stop_live_provider("队列排空超时")
-                    await asyncio.to_thread(live_thread.join, 0.5)
+                if not self.live2:
+                    if live_thread is not None and live_thread.is_alive():
+                        self._mark_live_failure("实时队列 1.5 秒内未排空")
+                        self._stop_live_provider("队列排空超时")
+                        await asyncio.to_thread(live_thread.join, 0.5)
+                else:
+                    # live2：只等音频侧排干（drain+尾音 ~0.7s）；提交序列
+                    # （toggle 关+剪贴板+粘贴+重开）已转交独立线程，不强停
+                    if live_thread is not None and live_thread.is_alive():
+                        await asyncio.to_thread(live_thread.join, 1.5)
                 self._live_q = None
                 self._live_started.clear()
                 self._live_prelude = []
                 self._live_request_at = 0.0
-                if not getattr(self, "_live_fallback_needed", False):
+                # 回退条件：实时未武装（prepare 失败/被挡）或本段实时失败。
+                # 旧实现只看 fallback_needed（上一段残留值）→ prepare 被
+                # 挡掉的段会被误判"成功"而无声丢弃（本次修复的第二半）
+                if getattr(self, "_live_armed", False) and not getattr(
+                        self, "_live_fallback_needed", False):
                     return
-                self.log("实时桥接失败，本段回退为松手播放")
+                self.log("实时桥接失败/未启动，本段回退为松手播放")
             # v2 松手播放，或 v3 门禁失败后的本段回退
             if True:
                 buffered = list(frames)
@@ -1503,30 +1561,41 @@ class VoiceDaemon:
         self._live_process_item(("audio", frame))
 
     def _live_session(self, generation: int):
-        """短按启动 WeType，实时写 CABLE，STOP 后排空并再次短按提交。"""
+        """实时会话线程：面板现开/复用，实时写 CABLE，STOP 后排空收尾。"""
         q = self._live_q
         drain = self._live_drain
         pending = bytearray()
-        started_deadline = time.monotonic() + 2.5
-        writer_locked = self._playback_lock.acquire(blocking=False)
+        started_deadline = time.monotonic() + 4.0
+        # 限时等待锁：快速连按时等上一段排空释放（期间本段帧安全在 prelude）；
+        # 阻塞的是本线程（live_session），不影响 asyncio 主循环与帧回调
+        writer_locked = self._playback_lock.acquire(timeout=3.5)
         try:
             if not writer_locked:
-                self._mark_live_failure("上一段仍在占用 CABLE 写入器")
+                self._mark_live_failure("等待 CABLE 写入器超时（上一段未排空）")
                 return
             if not self._ensure_cable_stream():
                 self._mark_live_failure("无法打开 CABLE Input")
                 return
             self._reset_live_pipeline()
-            self._close_stale_wetype_panel()
-            self._wait_remote_f5_gate()
-            if not self._start_live_provider():
-                self._mark_live_failure("WeType toggle 启动失败")
-                return
-            if not self._wait_wetype_ready():
-                self._mark_live_failure(
-                    f"WeType 语音面板未在 {self._wetype_ready_timeout():.1f} 秒内出现"
-                )
-                return
+            if self.live2:
+                # live2（用户方案）：按下瞬间现开面板，音频先缓冲（prelude）、
+                # 面板就绪后补进+实时跟随（"声音稍延迟输入"）。此时 F5 已被
+                # LL 钩子吞（系统无 F5 按住），防误触不触发；若上段面板残留
+                # 未关则直接复用。开不了（1.8s×2 重试）→ 回退松手播放。
+                if not self._ensure_panel_open():
+                    self._mark_live_failure("live2 面板现开失败（看『语音键 HID 报告』日志行：未抑制=抹除失效，已抑制=面板注入被拒）")
+                    return
+            else:
+                self._close_stale_wetype_panel()
+                self._wait_remote_f5_gate()
+                if not self._start_live_provider():
+                    self._mark_live_failure("WeType toggle 启动失败")
+                    return
+                if not self._wait_wetype_ready():
+                    self._mark_live_failure(
+                        f"WeType 语音面板未在 {self._wetype_ready_timeout():.1f} 秒内出现"
+                    )
+                    return
             self._live_ready.set()
             ready_elapsed = (time.monotonic() - self._live_request_at) * 1000
             self.log(f"WeType 已进入监听 +{ready_elapsed:.0f}ms，开始实时送音")
@@ -1575,17 +1644,29 @@ class VoiceDaemon:
                     break
 
             if not self._live_failed and self._cable_stream is not None:
-                tail_samples = int(self._live_rate * 0.15)
+                # 尾音与收尾等待加长（0.15/0.18 -> 0.35/0.5）：WeType 的 VAD
+                # 需要足够静音确认句尾，过早 toggle 关会吞掉最后几个字
+                tail_samples = int(self._live_rate * 0.35)
                 self._cable_stream.write(b"\x00\x00" * tail_samples)
-                time.sleep(0.18)
+                time.sleep(0.5)
         except Exception as exc:
             self._close_cable_stream()
             self._mark_live_failure(f"CABLE 实时写入中断: {exc}")
         finally:
-            self._stop_live_provider("音频已排空" if not self._live_failed else "实时门禁失败")
+            superseded = generation != self._live_generation  # 已被更新的段取代
+            if self.live2 and not self._live_failed and not superseded:
+                # live2 结束序列（toggle 关+剪贴板+粘贴）独立线程，
+                # 不阻塞 _end_session（那里对 live2 跳过 join）
+                threading.Thread(
+                    target=self._finish_live2_session, daemon=True, name="live2-finish",
+                ).start()
+            elif not self.live2 and not superseded:
+                self._stop_live_provider("音频已排空" if not self._live_failed else "实时门禁失败")
+            # 被取代的旧段：不收尾、不关面板（面板与新段连续复用，两段话
+            # 由新段的结束序列一并收割提交）——这是快速连按的让位机制
             with self._live_order_lock:
                 self._live_pipeline_ready = False
-            if self._live_request_at > 0:
+            if not superseded and self._live_request_at > 0:
                 elapsed = (time.monotonic() - self._live_request_at) * 1000
                 self.log(f"实时延迟 provider 提交 +{elapsed:.0f}ms")
             self._live_ready.clear()
@@ -1598,15 +1679,165 @@ class VoiceDaemon:
             else:
                 self.log("已送入输入法（实时模式）")
 
-    def _wechat_playback(self, frames: list[bytes], meta: dict | None = None):
-        """松手后播放（v2 回退模式，工作线程）：按住热键 -> 播放缓冲 -> 松开。
+    # ---- live2（时序错位路线，2026-08-29 实测定型）----
+    def _release_all_modifiers(self):
+        """强制松开全部修饰键（注入卫生）：toggle 三键的慢速 up 在某些
+        时序下不能完全消化，残留的 Win 会把粘贴 Ctrl+V 变成 Win+Ctrl+V
+        （弹出系统声音设置）。粘贴前必须清场。"""
+        from . import actions
+        for vk in (0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,  # L/R Shift/Ctrl/Alt
+                   0x5B, 0x5C):                          # L/R Win
+            actions._tap(vk, up=True)
 
-        串行互斥：连续两段语音不会并发写 CABLE（并发写触发 AUDCLNT_E_OUT_OF_ORDER）。
+    def _paste_text(self):
+        """清场修饰键后粘贴（Ctrl+V）。"""
+        from . import actions
+        self._release_all_modifiers()
+        time.sleep(0.05)
+        actions.send_combo(["VK_CONTROL", "VK_V"])
+
+    def _tap_toggle_slow(self, hold: float = 0.5, gap: float = 0.06):
+        """慢速三键 toggle（人类节奏）。快速连发会被 WeType 事件流吞掉——
+        8-29 实测：微秒级连发关不掉面板，60ms 节奏 0.5s 干净关闭。"""
+        from . import actions
+        from .keys import name_to_vk
+        vks = [name_to_vk(n) for n in self.toggle_hotkey]
+        for vk in vks:
+            actions._tap(vk)
+            time.sleep(gap)
+        time.sleep(hold)
+        for vk in reversed(vks):
+            actions._tap(vk, up=True)
+            time.sleep(gap)
+
+    def _ensure_panel_open(self, timeout: float = 1.8, retries: int = 2) -> bool:
+        """切换式面板在=直接复用；不在=注入开启并确认（带重试）。live2 核心：
+        所有面板操作都发生在空闲窗口（无硬件键按住），实测注入有效。
+        重试必要：紧贴的"关→开"序列会让 WeType 状态机短暂紊乱（首测段4起
+        连续现开失败的根因），第二次 toggle 前留 0.8s 喘息。"""
+        if self._wetype_panel_visible():
+            return True
+        for attempt in range(retries):
+            self._tap_toggle_slow(hold=0.8)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not self._stop.is_set():
+                if self._wetype_panel_visible():
+                    return True
+                time.sleep(0.08)
+            if attempt + 1 < retries:
+                time.sleep(0.8)  # 给 WeType 状态机喘息
+        return False
+
+    def _prime_panel(self):
+        """已废弃：不再预开面板（语音会话常开=通信模式静音其他声音流）。
+        保留空实现仅为兼容可能的旧调用。"""
+        return
+
+    def _harvest_clipboard(self, timeout: float = 2.5) -> str | None:
+        """等待 WeType 切换式结束写入剪贴板的新文本（与快照不同且非空）。"""
+        from . import actions
+        old = self._clip_before
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stop.is_set():
+            text = actions.get_clipboard_text()
+            if text and text.strip() and text != old:
+                return text
+            time.sleep(0.1)
+        return None
+
+    def _toggle_close_and_paste(self, old_clip: str | None, timeout: float = 4.5):
+        """live2 统一收尾：慢速 toggle 关面板（失败自动补关）→ 收割剪贴板
+        （增量去重）→ 清修饰键后 Ctrl+V 粘贴。"""
+        from . import actions
+        self._tap_toggle_slow()
+        text = None
+        closed = False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if not closed and not self._wetype_panel_visible():
+                closed = True
+            t = actions.get_clipboard_text()
+            if t and t.strip() and t != old_clip:
+                text = t
+                break
+            time.sleep(0.1)
+        # 面板关不掉=会话未结束，下一段识别会与旧文本累积拼接（重复主因）
+        # ——补关：再 toggle 一次，仍不行注入 Esc 兜底
+        if self._wetype_panel_visible():
+            self._tap_toggle_slow(hold=0.4)
+            close_deadline = time.monotonic() + 1.5
+            while time.monotonic() < close_deadline and self._wetype_panel_visible():
+                time.sleep(0.1)
+            if self._wetype_panel_visible():
+                from .keys import name_to_vk
+                actions._tap(name_to_vk("VK_ESCAPE"))
+                esc_deadline = time.monotonic() + 3.0
+                while time.monotonic() < esc_deadline and self._wetype_panel_visible():
+                    time.sleep(0.1)
+            if not self._wetype_panel_visible():
+                closed = True
+                # Esc 兜底关闭后剪贴板可能才写入，再补收割一轮
+                extra_deadline = time.monotonic() + 2.0
+                while time.monotonic() < extra_deadline and not text:
+                    t = actions.get_clipboard_text()
+                    if t and t.strip() and t != old_clip:
+                        text = t
+                    time.sleep(0.1)
+        last = getattr(self, "_last_pasted_text", "")
+        if text and text == last:
+            self.log(f"live2: 跳过重复文本（与上一段相同）: {text[:30]}")
+            text = None
+        if text and last and text.startswith(last) and len(text) > len(last):
+            # 残留面板累积=旧文本+新文本拼接：只粘增量，防旧文重复
+            text = text[len(last):]
+            self.log(f"live2: 检测到累积拼接，仅粘贴增量")
+        if text:
+            # 稳定窗口：WeType 对长文本会分块写剪贴板，等文本停止变化再粘
+            stable_until = time.monotonic() + 0.5
+            while time.monotonic() < stable_until and not self._stop.is_set():
+                t2 = actions.get_clipboard_text()
+                if t2 and t2 != text:
+                    text = t2
+                    stable_until = time.monotonic() + 0.5
+                time.sleep(0.1)
+        full_text = text
+        if text:
+            time.sleep(0.15)  # 等焦点稳定
+            self._paste_text()
+            # 记录完整文本（非增量），供下一段做前缀对比
+            self._last_pasted_text = full_text
+            self.log(f"live2 已上屏: {text[:50]}")
+        elif text is None and closed:
+            self.log("live2: 剪贴板无新文本（识别空/写入延迟/未提交）")
+        if not closed:
+            self.log("live2: toggle 未关掉面板")
+
+    def _finish_live2_session(self):
+        """live2 结束序列（独立线程，不阻塞会话主循环）：切换式收尾
+        （关面板+收割+粘贴），不重开面板（语音会话常开会切通信模式
+        静音其他声音流，用户要求用完即关）。"""
+        try:
+            if not self._wetype_panel_visible():
+                self.log("live2: 面板已不在（可能被手动关闭），跳过提交")
+                return
+            self._toggle_close_and_paste(self._clip_before)
+        except Exception as e:
+            self.log(f"live2 结束序列异常: {e}")
+
+    def _wechat_playback(self, frames: list[bytes], meta: dict | None = None):
+        """松手后播放（回退模式，工作线程）。
+
+        live2 回退：统一切换式（toggle 开→播放→toggle 关→收割粘贴），
+        与主路径面板控制完全一致——按住式（Ctrl+Alt+V）与切换式两种
+        会话类型交替会污染 WeType 状态机（用户实测"两种模式混杂导致
+        唤起不稳定"）。非 live2 保持原行为（v4 toggle / 稳定版按住式）。
+        串行互斥：连续两段不会并发写 CABLE（OUT_OF_ORDER）。
         """
         if not self._playback_lock.acquire(blocking=False):
             self.log("(上一段仍在播放，本段丢弃)")
             return
         toggle_started = False
+        live2_toggle = False
         try:
             pcm, stats, metrics = self._decode_session(frames, meta)
             if not pcm:
@@ -1621,16 +1852,27 @@ class VoiceDaemon:
             self.log(message)
             if diagnostic_path is not None:
                 self.log(f"诊断 WAV: {diagnostic_path}")
-            if self.live:
+            if self.live2 or self.live:
+                # 实时系（live2/开发版）回退：切换式开面板（与主路径同一套
+                # 动作）；非实时稳定版保持按住式原行为
+                if not self._ensure_panel_open():
+                    self.log("live2 回退播放失败: 面板无法开启")
+                    return
+                live2_toggle = True
+            elif self.live:
                 toggle_started = self._tap_hotkey(80)
                 if not toggle_started:
                     self.log("微信回退播放失败: WeType toggle 启动失败")
                     return
             else:
-                self._press_hotkey(down=True)  # 稳定版松手播放保持原按住式配置
+                # 稳定版：按住式 down→播放→up（松手后空闲注入，已验证）
+                self._press_hotkey(down=True)
             time.sleep(0.45)                 # 等输入法麦克风就绪
             if not self._ensure_cable_stream():
-                if toggle_started:
+                if live2_toggle:
+                    self._toggle_close_and_paste(None)
+                    live2_toggle = False
+                elif toggle_started:
                     self._tap_hotkey(80)
                     toggle_started = False
                 else:
@@ -1656,7 +1898,18 @@ class VoiceDaemon:
                 prev = float(cur)
             self._cable_stream.write(_s.pack(f"<{len(out)}h", *out))
             time.sleep(0.35)                 # 尾音播完
-            if toggle_started:
+            if live2_toggle:
+                # live2 回退：切换式收尾（与主路径一致：关面板+收割+粘贴）
+                from . import actions as _act
+                old_clip = None
+                try:
+                    old_clip = _act.get_clipboard_text()
+                except Exception:
+                    pass
+                self._toggle_close_and_paste(old_clip)
+                toggle_started = False
+                live2_toggle = False
+            elif toggle_started:
                 self._tap_hotkey(80)
                 toggle_started = False
             else:
@@ -1666,7 +1919,10 @@ class VoiceDaemon:
             import traceback
             self.log(f"微信播放管线异常: {e}\n{traceback.format_exc()}")
             try:
-                if toggle_started:
+                if live2_toggle:
+                    self._toggle_close_and_paste(None)
+                    live2_toggle = False
+                elif toggle_started:
                     self._tap_hotkey(80)
                     toggle_started = False
                 else:

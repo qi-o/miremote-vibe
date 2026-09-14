@@ -6,9 +6,13 @@ run 动作委托给 runner.py（argv 列表、shell=False）。
 from __future__ import annotations
 
 import ctypes
+import os
 import re
+import threading
 import time
+import winreg
 from ctypes import wintypes as wt
+from pathlib import Path
 
 from . import runner
 from .keys import name_to_vk
@@ -139,6 +143,27 @@ def type_text(text: str):
     send_combo(["VK_CONTROL", "VK_V"])
 
 
+def get_clipboard_text() -> str | None:
+    """读剪贴板文本（CF_UNICODETEXT）；无文本/失败返回 None。"""
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.GetClipboardData.argtypes = (ctypes.c_uint,)
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        h = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = kernel32.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            kernel32.GlobalUnlock(h)
+    finally:
+        user32.CloseClipboard()
+
+
 # ---- 窗口聚焦 ----
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
@@ -183,6 +208,91 @@ def focus_window(title_regex: str) -> bool:
     return bool(user32.SetForegroundWindow(hwnd))
 
 
+# ---- 语义动作(beta 新增,思路来自 RC003 的 ActionKind)----
+# 配置里写 {"type": "show_desktop"} 这类语义名,而不是具体按键串,
+# 以后调整实现不影响用户配置。
+
+def _app_switcher():
+    """Alt+Tab:按住 Alt、点 Tab、松 Alt。"""
+    _tap(name_to_vk("VK_MENU"))
+    time.sleep(0.03)
+    _tap(name_to_vk("VK_TAB"))
+    time.sleep(0.03)
+    _tap(name_to_vk("VK_TAB"), up=True)
+    _tap(name_to_vk("VK_MENU"), up=True)
+
+
+def _resolve_app_path(exe: str) -> str | None:
+    """从注册表 App Paths(HKCU/HKLM)解析 exe 绝对路径,失败返回 None。"""
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(
+                root,
+                r"Software\Microsoft\Windows\CurrentVersion\App Paths\\" + exe,
+            ) as k:
+                val, _t = winreg.QueryValueEx(k, None)
+                if val:
+                    path = os.path.expandvars(val.strip().strip('"'))
+                    if os.path.isfile(path):
+                        return path
+        except OSError:
+            continue
+    return None
+
+
+def _start_menu_lnk(names: list[str]) -> str | None:
+    """在两级开始菜单里找 names 对应的 .lnk(如 "微信" -> 微信.lnk)。"""
+    roots = [
+        Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    ]
+    wanted = [f"{n}.lnk".lower() for n in names if n]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f.lower() in wanted:
+                    return str(Path(dirpath) / f)
+    return None
+
+
+def open_app(targets: list[str], window: list[str] | None = None,
+             args: list[str] | None = None, lnk: list[str] | None = None) -> str:
+    """打开或聚焦一个应用:窗口在 -> 聚焦;否则解析 exe / 开始菜单快捷方式启动。
+
+    targets: 候选 exe 文件名列表(按序尝试,如 ["Weixin.exe", "WeChat.exe"])
+    window:  可选的窗口标题正则列表(命中即聚焦,不再启动)
+    lnk:     可选的开始菜单快捷方式名列表(如 ["微信", "WeChat"] -> 微信.lnk)
+    """
+    for pattern in window or []:
+        try:
+            if focus_window(pattern):
+                return f"open_app 聚焦[{pattern}]"
+        except Exception:
+            continue
+    args = args or []
+    for exe in targets or []:
+        path = _resolve_app_path(exe)
+        if path:
+            runner.launch([path, *args])
+            return f"open_app 启动 {path}"
+    lnk_path = _start_menu_lnk(lnk or [])
+    if lnk_path:
+        threading.Thread(
+            target=os.startfile, args=(lnk_path,), daemon=True
+        ).start()
+        return f"open_app 启动快捷方式 {lnk_path}"
+    for exe in targets or []:
+        try:
+            runner.launch([exe, *args])
+            return f"open_app 启动 {exe}(PATH)"
+        except Exception:
+            continue
+    return "open_app 失败:窗口未找到且无法启动"
+
+
 # ---- 动作分发 ----
 
 def perform(action: dict) -> str:
@@ -200,6 +310,31 @@ def perform(action: dict) -> str:
         delta = int(action.get("delta", 0))
         volume(delta)
         return "volume " + str(delta)
+    if t == "show_desktop":
+        send_combo(["VK_LWIN", "VK_D"])
+        return "显示桌面"
+    if t == "context_menu":
+        send_combo(["VK_SHIFT", "VK_F10"])
+        return "右键菜单"
+    if t == "app_switcher":
+        _app_switcher()
+        return "Alt+Tab 切窗口"
+    if t == "play_pause":
+        tap_key("VK_MEDIA_PLAY_PAUSE")
+        return "媒体 播放/暂停"
+    if t == "media_next":
+        tap_key("VK_MEDIA_NEXT_TRACK")
+        return "媒体 下一首"
+    if t == "media_prev":
+        tap_key("VK_MEDIA_PREV_TRACK")
+        return "媒体 上一首"
+    if t == "open_app":
+        return open_app(
+            action.get("targets", []),
+            window=action.get("window"),
+            args=action.get("args"),
+            lnk=action.get("lnk"),
+        )
     if t == "focus":
         pattern = action["title_regex"]
         ok = focus_window(pattern)

@@ -13,8 +13,39 @@ import time
 from pathlib import Path
 
 from . import actions
-from .keys import vk_name
+from .gestures import GestureDispatcher, Trigger
+from .keys import name_to_vk, vk_name
 from .rawinput import RawInputEngine
+
+
+# ---- 三手势槽位(beta 新增)----
+# 配置 v2:每个键 {"click":…, "double_click":…, "long_press":…};
+# 老配置的 "on_down" 自动迁移为单击槽,读取时兼容,保存时双写。
+GESTURE_SLOTS = ("click", "double_click", "long_press")
+SLOT_LABELS = {"click": "单击", "double_click": "双击", "long_press": "长按"}
+
+
+def key_slots(entry: dict) -> dict:
+    """取一个键的三个手势动作槽;缺省槽位为 no-op。"""
+    entry = entry or {}
+    click = entry.get("click", entry.get("on_down", {"type": "none"}))
+    return {
+        "click": dict(click or {"type": "none"}),
+        "double_click": dict(entry.get("double_click") or {"type": "none"}),
+        "long_press": dict(entry.get("long_press") or {"type": "none"}),
+    }
+
+
+def key_summary(entry: dict) -> str:
+    """一键三手势的一行中文摘要(列表展示用)。"""
+    parts = []
+    for slot in GESTURE_SLOTS:
+        action = key_slots(entry)[slot]
+        if action.get("type", "none") == "none":
+            continue
+        text = action_summary(action)
+        parts.append(text if slot == "click" else f"{SLOT_LABELS[slot]}={text}")
+    return " · ".join(parts) if parts else "无操作"
 
 
 def realtime_dev_build() -> bool:
@@ -82,6 +113,12 @@ DEFAULT_CONFIG = {
     # 播放策略：False=松手后整段重放（v2，8-24 验证过、不依赖吞键钩子）；
     # True=ATVV 驱动的实时实验模式（开发版强制开启；稳定版默认关闭）
     "wechat_live": False,
+    # live2（时序错位路线，2026-08-29 实测定型）：面板预开复用+按住期间零
+    # 注入+松手后慢速 toggle 关闭+剪贴板收割+Ctrl+V 粘贴。需 wechat_live=true。
+    "wechat_live2": False,
+    # 切换式「启动语音输入」热键（WeType 设置里的那组；微信 PC 也占用了
+    # Ctrl+Win，注入时微信会陪跑闪窗——介意可在微信设置改其语音热键）
+    "wechat_toggle_hotkey": ["VK_CONTROL", "VK_LWIN", "VK_SHIFT"],
     "wechat_ready_delay": 0.45,   # 面板热键后等输入法就绪的秒数（丢了开头可调大）
     "voice_diagnostics": False,   # 调试时覆盖保存最后一段 WAV/ADPCM/指标
     "keys": {
@@ -112,6 +149,14 @@ ACTION_TYPES = [
     ("type", "输入文本", {"text": ""}),
     ("focus_then_keys", "聚焦窗口后按键", {"title_regex": "", "combo": []}),
     ("run", "运行程序", {"argv": []}),
+    # ---- 语义动作(beta 新增) ----
+    ("show_desktop", "显示桌面", {}),
+    ("context_menu", "右键菜单", {}),
+    ("app_switcher", "Alt+Tab 切窗口", {}),
+    ("play_pause", "媒体 播放/暂停", {}),
+    ("media_next", "媒体 下一首", {}),
+    ("media_prev", "媒体 上一首", {}),
+    ("open_app", "打开/聚焦应用", {"targets": [], "window": [], "args": []}),
 ]
 
 
@@ -135,6 +180,21 @@ def action_summary(action: dict) -> str:
         return f"聚焦[{action.get('title_regex', '')}]+按键"
     if t == "run":
         return f"运行 {action.get('argv', [])}"
+    if t == "show_desktop":
+        return "显示桌面"
+    if t == "context_menu":
+        return "右键菜单"
+    if t == "app_switcher":
+        return "Alt+Tab 切窗口"
+    if t == "play_pause":
+        return "媒体 播放/暂停"
+    if t == "media_next":
+        return "媒体 下一首"
+    if t == "media_prev":
+        return "媒体 上一首"
+    if t == "open_app":
+        targets = "+".join(action.get("targets", [])) or "?"
+        return f"打开应用({targets})"
     return str(t)
 
 
@@ -150,6 +210,8 @@ class MiRemoteService:
         self._voice = None
         self._tap = None
         self._llhook = None
+        self._gestures: GestureDispatcher | None = None
+        self._leak = None
 
     # ---- 配置 ----
     def _load_config(self) -> dict:
@@ -182,9 +244,13 @@ class MiRemoteService:
 
     def _start_f5_hook_if_needed(self, eng: RawInputEngine):
         dev = self.config.get("device", {})
+        # LL 钩子只服务 Codex v4 开发版（live 且非 live2）；live2 改用
+        # Gadget 报文级抹除（更彻底：全系统任何通道都看不到 F5，且不受
+        # 钩子链顺序影响——WeType 重装钩子插队也无所谓）。
         if not (
             dev.get("voice", True)
             and self.config.get("wechat_live", False)
+            and not self.config.get("wechat_live2", False)
             and self._voice is not None
             and self._voice.ready
         ):
@@ -238,6 +304,14 @@ class MiRemoteService:
         eng.start_background()
         self._engine = eng
 
+        # 1b) 手势引擎(beta):单击/双击/长按三槽调度;语音键在 _on_raw_key 旁路
+        self._gestures = GestureDispatcher(
+            is_action_configured=self._slot_configured,
+            is_repeatable=self._slot_repeatable,
+            on_trigger=self._fire_gesture,
+            repeat_timing_of=self._repeat_timing,
+        )
+
         # 2) 语音引擎
         if dev.get("voice", True):
             try:
@@ -254,6 +328,11 @@ class MiRemoteService:
                     mode=mode,
                     wechat_hotkey=self.config.get("wechat_hotkey"),
                     live=self.config.get("wechat_live", True),
+                    live2=self.config.get("wechat_live2", False),
+                    toggle_hotkey=self.config.get("wechat_toggle_hotkey"),
+                    arm_suppression=lambda: bool(
+                        self._tap and self._tap.arm_voice_suppression(2000)
+                    ),
                     ready_delay=self.config.get("wechat_ready_delay", 0.45),
                     diagnostics=self.config.get("voice_diagnostics", False),
                     diagnostics_root=app_data_dir() / "diagnostics",
@@ -261,7 +340,13 @@ class MiRemoteService:
                 self._voice = vd
                 if vd.start():
                     if mode == "wechat":
-                        playback_mode = "实时模式" if self.config.get("wechat_live", False) else "松手播放模式"
+                        if self.config.get("wechat_live2", False):
+                            playback_mode = "实时模式 live2：面板预开+切换式，"
+                            "按住说话面板实时出字，松手自动提交粘贴"
+                        elif self.config.get("wechat_live", False):
+                            playback_mode = "实时模式（实验）"
+                        else:
+                            playback_mode = "松手播放模式"
                         self.on_log(f"语音引擎就绪（微信输入法{playback_mode}）：按住语音键说话，"
                                     "松手出字")
                     else:
@@ -287,23 +372,61 @@ class MiRemoteService:
                 }
 
                 def on_edge(name: str, is_down: bool):
-                    if not is_down:
-                        return
                     key = TAP_KEYS.get(name)
                     conf = keys.get(key) if key else None
                     if conf is None:
                         return
-                    self._run_action(conf, conf.get("label", name), f"tap:{name}")
+                    # 哑键同样走手势引擎(默认立即路径,行为与旧版一致;
+                    # 配置双击/长按槽后即获得手势,repeat 可开长按连发)
+                    if is_down:
+                        self._gestures.press(key)
+                    else:
+                        self._gestures.release(key)
 
+                # live2：Gadget 层常开抹除语音键 usage(0x3E)——F5 从不进系统
+                # （按 usage 抹零、首条即生效、down 抹成空报文=天然等效 up 无
+                # 卡键、仅 RC003 通道）。按下瞬间现开面板的防误触由此根除；
+                # 语音触发走 ATVV 帧自检。非 live2 保持 False（正式行为）。
+                live2_mode = bool(
+                    self.config.get("voice_mode") == "wechat"
+                    and self.config.get("wechat_live", False)
+                    and self.config.get("wechat_live2", False)
+                )
                 self._tap = BackKeyTap(
                     on_edge=on_edge,
                     log=lambda m: self.on_log(f"[tap] {m}"),
-                    suppress_voice=False,
+                    suppress_voice=live2_mode,
                 )
                 self._tap.start()
-                self.on_log("哑键拦截已启动（首次会弹 UAC 提权）")
+                self.on_log("哑键拦截已启动（首次会弹 UAC 提权）"
+                            + ("，语音键已 Gadget 级抹除（live2）" if live2_mode else ""))
             except Exception as e:
                 self.on_log(f"哑键拦截不可用: {e}")
+
+        # 4) 按键泄漏抑制(beta,选配):键位条目里 suppress_leak=true 才启用。
+        #    语音键与 TAP_ 哑键不参与(语音键需 llhook 专用方案,哑键不进系统)。
+        try:
+            leak_vks = set()
+            for k, entry in keys.items():
+                if not isinstance(entry, dict) or not entry.get("suppress_leak"):
+                    continue
+                if k.startswith("TAP_"):
+                    continue
+                if key_slots(entry)["click"].get("type") == "voice":
+                    self.on_log(f"[leak] {k} 是语音键,泄漏抑制需实时模式钩子,已忽略")
+                    continue
+                try:
+                    leak_vks.add(name_to_vk(k))
+                except ValueError:
+                    continue
+            if leak_vks:
+                from . import leaksup
+                self._leak = leaksup.LeakSuppressor(
+                    leak_vks, log=lambda m: self.on_log(f"[leak] {m}")
+                )
+                self._leak.start()
+        except Exception as e:
+            self.on_log(f"泄漏抑制不可用: {e}")
 
     def stop(self):
         with self._lock:
@@ -338,10 +461,21 @@ class MiRemoteService:
             except Exception:
                 pass
             self._engine = None
+        if self._gestures:
+            try:
+                self._gestures.reset()
+            except Exception:
+                pass
+            self._gestures = None
+        if self._leak:
+            try:
+                self._leak.stop()
+            except Exception:
+                pass
+            self._leak = None
 
     # ---- 按键处理 ----
-    def _run_action(self, conf: dict, label: str, source: str):
-        action = conf.get("on_down", {"type": "none"})
+    def _run_action_dict(self, action: dict, label: str, source: str):
         if action.get("type") == "voice":
             if self._voice:
                 self._voice.begin()
@@ -352,24 +486,72 @@ class MiRemoteService:
         desc = actions.perform(action)
         self.on_log(f"{label} ({source}) -> {desc}")
 
+    def _run_action(self, conf: dict, label: str, source: str):
+        self._run_action_dict(conf.get("on_down", {"type": "none"}), label, source)
+
+    # ---- 手势引擎回调与槽位(beta) ----
+    def _slot_action(self, name: str, trigger: Trigger) -> dict:
+        return key_slots(self.config.get("keys", {}).get(name, {}))[trigger.value]
+
+    def _slot_configured(self, name: str, trigger: Trigger) -> bool:
+        return self._slot_action(name, trigger).get("type", "none") != "none"
+
+    def _slot_repeatable(self, name: str) -> bool:
+        """按住连发许可:tap/音量类自动允许(与键盘按住自动重复一致),
+        配置里 repeat: true/false 可显式强制开或关。"""
+        entry = self.config.get("keys", {}).get(name, {})
+        rep = entry.get("repeat")
+        if rep is not None:
+            return bool(rep)
+        return key_slots(entry)["click"].get("type") in ("volume", "tap")
+
+    def _repeat_timing(self, name: str) -> tuple:
+        """每键连发节律(首延迟秒, 间隔秒);配置 repeat_delay/repeat_interval 毫秒。"""
+        entry = self.config.get("keys", {}).get(name, {})
+        delay = float(entry.get("repeat_delay", 350)) / 1000.0
+        interval = float(entry.get("repeat_interval", 100)) / 1000.0
+        return (delay, interval)
+
+    def _fire_gesture(self, name: str, trigger: Trigger) -> None:
+        action = self._slot_action(name, trigger)
+        if action.get("type", "none") == "none":
+            return
+        entry = self.config.get("keys", {}).get(name, {})
+        label = entry.get("label", name)
+        suffix = "" if trigger is Trigger.CLICK else f"（{SLOT_LABELS[trigger.value]}）"
+        self._run_action_dict(action, label + suffix, f"{name}:{trigger.value}")
+
+    def _is_voice_key(self, name: str) -> bool:
+        return self._slot_action(name, Trigger.CLICK).get("type") == "voice"
+
     def _on_raw_key(self, ev):
         if not ev.is_remote or ev.hid_bytes is not None:
             return
         keys = self.config.get("keys", {})
         name = vk_name(ev.vkey)
+        entry = keys.get(name, {})
+        # 语音键旁路手势引擎:按下 begin、松开 finish(按住说话语义)。
+        # 若也进三手势引擎,"长按 550ms"会把说话吃掉。
+        if self._is_voice_key(name):
+            if ev.is_up:
+                self._held.discard(name)
+                if self._voice:
+                    self._voice.finish()
+            elif name not in self._held:
+                self._held.add(name)
+                if self._voice:
+                    self._voice.begin()
+                    self.on_log(f"{entry.get('label', name)} -> 开始录音（按住说话）")
+            return
+        # 选配:泄漏抑制武装(该键的物理边沿交由 LL 钩子裁决)
+        if self._leak is not None and isinstance(entry, dict) and entry.get("suppress_leak"):
+            self._leak.arm(ev.vkey, not ev.is_up)
+        if self._gestures is None:
+            return
         if ev.is_up:
-            self._held.discard(name)
-            conf = keys.get(name)
-            if conf and conf.get("on_down", {}).get("type") == "voice" and self._voice:
-                self._voice.finish()
-            return
-        if name in self._held:
-            return
-        self._held.add(name)
-        conf = keys.get(name)
-        if conf is None:
-            return
-        self._run_action(conf, conf.get("label", name), name)
+            self._gestures.release(name)
+        else:
+            self._gestures.press(name)
 
     # ---- 状态 ----
     def status(self) -> dict:

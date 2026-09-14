@@ -81,17 +81,22 @@ adjust volume.
 | 功能 | 说明 |
 |---|---|
 | 按键捕获 | 方向/OK/主页/菜单/TV/电源/语音键，Raw Input 按设备过滤（不影响物理键盘） |
+| **按键三手势** | **每键独立配置单击/双击/长按**（双击 300ms 等待窗、长按 550ms；未配手势的键零延迟立即触发） |
+| **按住连发** | "按一个键"类动作按住自动连发（350ms 首延迟 + 100ms 节律，均可用 `repeat_delay`/`repeat_interval` 调整）——返回键按住就是连续退格；长按槽触发后按住同样持续连发 |
+| **语义动作** | 显示桌面 / 右键菜单 / Alt+Tab / 媒体控制 / 打开或聚焦应用（窗口聚焦 → 注册表 App Paths → 开始菜单快捷方式 三级解析） |
 | **哑键救回** | **返回/音量±的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（tap4 协议：并发连接防护 + 控制握手，macOS 项目也没有的能力） |
 | 本地语音 | 按住说话→松手→ATVV 蓝牙协议解码→faster-whisper 本地转写→文字粘贴（全离线） |
 | 微信语音模式 | 松手后整段音频桥接给微信输入法识别（自动去语气词、整理语句）；需 VB-CABLE + 在微信输入法里把语音麦克风设为 CABLE Output、"按住说话"快捷键设为 Ctrl+Alt+V |
-| Qt GUI | 按键映射可视化编辑（点遥控器图绑键）+ 语音模式切换 + 日志 + 系统托盘 |
-| 回归测试 | 27 项 pytest 覆盖哑键协议解析/Gadget 版本协商/语音链路（`tests/`） |
+| Qt GUI | 按键映射可视化编辑（键位卡片墙 + 三手势槽 + 点遥控器图绑键）+ 语音模式切换 + 日志 + 系统托盘 |
+| 回归测试 | 27 项 pytest（哑键协议/Gadget 协商/语音链路）+ 37 项手势引擎断言（`tests/`） |
 | 开机自启 | 静默后台启动 + 自动启动守护 |
 
 > 状态：2026-08-29 tap4 稳定版。语音链路大坑已修（会话开始**不再主动发
 > MIC_OPEN**——固件 2671 上主动开麦会触发一条无声的"主机流"，把按住语音键
 > 的真实物理流堵死，表现为每段固定 1.9 秒无效音频）；MIC_CLOSE 后音频通知
 > 失效也已按言灵的 REOPEN RESET 序列修复。
+> **2026-09-14 键位系统升级**：新增每键三手势（单击/双击/长按）、按住连发
+> （含长按连发，返回键=按住连续退格）、语义动作层与键位卡片墙 UI。
 
 ## 它是怎么工作的
 
@@ -294,6 +299,9 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
   ATVV 语音协议（UUID、握手字节、opcode、ADPCM 帧格式）参考其协议文档（docs/PROTOCOL.md）。
 - **[nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)**
   Windows UI（PySide6）参考；其文档确认了返回键被 Windows 驱动丢弃的问题。
+  **三手势识别器（`miremote/gestures.py`）移植自其 RC003 的
+  `button_gesture.py`**（状态机、时序契约、派发器结构），
+  `miremote/leaksup.py` 的武装/吞边沿设计同样来自该项目。
 - **[godarrenw/mi_remote_control](https://github.com/godarrenw/mi_remote_control)**
   macOS 同类项目，桥接架构参考。
 
@@ -311,7 +319,10 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 
 - 本项目代码采用 **MIT** 许可（见 [LICENSE](LICENSE)）；
   例外：`miremote/tapinject.py` 与 `miremote/backkey.py` 衍生自
-  GPL-3.0 项目 remote-bridge-hub，这两个文件以 **GPL-3.0** 提供。
+  GPL-3.0 项目 remote-bridge-hub，`miremote/gestures.py` 与
+  `miremote/leaksup.py` 衍生自 GPL-3.0 项目 open-voice-bridge
+  （三手势识别器移植自其 RC003 `button_gesture.py`），
+  上述四个文件以 **GPL-3.0** 提供。
 - "Frida"、"VB-CABLE"、"微信输入法/WeType"、"小米/Xiaomi"为各自所有者的
   商标/产品，本项目与它们无隶属关系。
 
@@ -324,11 +335,14 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 | Feature | Notes |
 |---|---|
 | Button capture | D-pad / OK / Home / Menu / TV / Power / Voice via Raw Input, filtered by device (physical keyboard untouched) |
+| **Three gestures per key** | **Independent single-click / double-click / long-press per button** (300 ms double-click window, 550 ms long-press; keys without a configured gesture stay zero-latency) |
+| **Hold-to-repeat** | "Tap-a-key" actions auto-repeat while held (350 ms initial delay + 100 ms cadence, both tunable via `repeat_delay`/`repeat_interval`) — hold Back for continuous backspace; a fired long-press also keeps repeating while held |
+| **Semantic actions** | Show desktop / context menu / Alt+Tab / media keys / open-or-focus app (three-level resolution: window focus → registry App Paths → Start-Menu shortcut) |
 | **Dead-key recovery** | **Back / Volume± HID reports are silently dropped by the Windows driver** — recovered by injecting a Frida Gadget into WUDFHost (tap4 protocol: concurrent-connection guard + control handshake; not even the macOS projects do this) |
 | Local voice | Hold-to-talk → release → ATVV Bluetooth decode → faster-whisper local transcription → paste (fully offline) |
 | WeChat voice mode | After release, the whole utterance is bridged to WeType IME recognition (auto-removes filler words); requires VB-CABLE, WeType mic set to CABLE Output, and WeType's hold-to-talk hotkey set to Ctrl+Alt+V |
-| Qt GUI | Visual key remapping (click the remote picture) + voice mode switch + log + system tray |
-| Regression tests | 27 pytest cases covering the dead-key protocol / Gadget version negotiation / voice chain (`tests/`) |
+| Qt GUI | Visual key remapping (key cards + three-gesture slots + click-the-remote binding) + voice mode switch + log + system tray |
+| Regression tests | 27 pytest cases (dead-key protocol / Gadget negotiation / voice chain) + 37 gesture-engine assertions (`tests/`) |
 | Boot autostart | Silent background start + service auto-launch |
 
 > Status: tap4 stable, 2026-08-29. The big voice-chain bug is fixed: sessions
@@ -336,7 +350,10 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 > opens a silent "host stream" that blocks the real physical stream (symptom:
 > every utterance was a fixed ~1.9 s of useless audio). The post-MIC_CLOSE
 > audio-notify subscription loss is fixed too, via vibe-flow's REOPEN RESET
-> sequence.
+> sequence. **2026-09-14 key-system upgrade**: per-key three gestures
+> (single/double/long), hold-to-repeat (including repeat-after-long-press —
+> hold Back for continuous backspace), a semantic action layer, and a
+> key-card mapping UI.
 
 ## How It Works
 
@@ -590,7 +607,10 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
   per their protocol notes (docs/PROTOCOL.md).
 - **[nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)**
   Windows UI (PySide6) reference; their docs confirmed the driver-dropped
-  Back key.
+  Back key. **The three-gesture recognizer (`miremote/gestures.py`) is a
+  port of their RC003 `button_gesture.py`** (state machine, timing contract,
+  dispatcher shape), and `miremote/leaksup.py` borrows their armed-edge
+  suppression design.
 - **[godarrenw/mi_remote_control](https://github.com/godarrenw/mi_remote_control)**
   macOS sibling; bridging architecture reference.
 
@@ -608,6 +628,9 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
 
 - This project's code is released under the **MIT** license (see [LICENSE](LICENSE));
   exception: `miremote/tapinject.py` and `miremote/backkey.py` derive from
-  the GPL-3.0 project remote-bridge-hub and are provided under **GPL-3.0**.
+  the GPL-3.0 project remote-bridge-hub, and `miremote/gestures.py` and
+  `miremote/leaksup.py` derive from the GPL-3.0 project open-voice-bridge
+  (the three-gesture recognizer is a port of its RC003 `button_gesture.py`);
+  these four files are provided under **GPL-3.0**.
 - "Frida", "VB-CABLE", "WeType/微信输入法" and "Xiaomi/小米" are trademarks or
   products of their respective owners; this project is not affiliated with them.

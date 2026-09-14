@@ -442,6 +442,7 @@ class BackKeyTap:
         self._suppression_ack = False
         self._control_ack = False
         self._voice_report_logged = False
+        self._voice_report_at = 0.0
         self._voice_channel_bound = False
 
     def _set_suppression_ack(self, ready: bool):
@@ -520,8 +521,13 @@ class BackKeyTap:
             except (TypeError, ValueError):
                 return
             all_usages = decode_tap_report(data)
-            if VOICE_USAGE in all_usages and not self._voice_report_logged:
+            now = time.time()
+            if VOICE_USAGE in all_usages and (
+                not self._voice_report_logged or now - self._voice_report_at > 8.0
+            ):
+                # 每段都打：抑制状态是 live2 稳定性的第一归因信号
                 self._voice_report_logged = True
+                self._voice_report_at = now
                 suppressed = message.get("suppressed_voice") is True
                 self.log(
                     f"语音键 HID 报告已确认: {raw} "

@@ -20,7 +20,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import actions
 from .remote_widget import RemoteWidget, KEY_RECTS
-from .service import MiRemoteService, action_summary, realtime_dev_build
+from .service import (MiRemoteService, SLOT_LABELS, action_summary,
+                      key_slots, key_summary, realtime_dev_build)
 
 # ---- 深色主题调色板 ----
 BG = "#0d1117"
@@ -177,6 +178,18 @@ PRESETS: list[tuple[str, dict]] = [
     ("Shift+Tab 切权限", {"type": "keys", "combo": ["VK_SHIFT", "VK_TAB"]}),
     ("Win+H 语音输入", {"type": "keys", "combo": ["VK_LWIN", "VK_H"]}),
     ("Win+D 显示桌面", {"type": "keys", "combo": ["VK_LWIN", "VK_D"]}),
+    # ---- 语义动作(beta 新增) ----
+    ("右键菜单", {"type": "context_menu"}),
+    ("Alt+Tab 切窗口", {"type": "app_switcher"}),
+    ("媒体 播放/暂停", {"type": "play_pause"}),
+    ("媒体 下一首", {"type": "media_next"}),
+    ("媒体 上一首", {"type": "media_prev"}),
+    ("打开/聚焦微信", {"type": "open_app", "targets": ["Weixin.exe", "WeChat.exe"],
+                     "window": ["微信", "WeChat"], "lnk": ["微信", "WeChat"]}),
+    ("打开/聚焦 Cursor", {"type": "open_app", "targets": ["Cursor.exe"],
+                       "window": ["Cursor"]}),
+    ("打开/聚焦 Chrome", {"type": "open_app", "targets": ["chrome.exe", "Chrome.exe"],
+                       "window": ["Chrome", "Chrome"]}),
     ("录制单个键…", None),
     ("录制组合键…", None),
     ("输入文本…", None),
@@ -247,7 +260,114 @@ def _css() -> str:
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px; }}
     QScrollBar::handle:vertical {{ background: #33465b; border-radius: 5px; min-height: 30px; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollArea {{ background: transparent; border: none; }}
+    QScrollArea > QWidget > QWidget {{ background: transparent; }}
+
+    /* ---- 键位卡片(beta UI 翻新) ---- */
+    QFrame#keyCard {{ background: #111821; border: 1px solid #223040;
+                      border-radius: 12px; }}
+    QFrame#keyCard:hover {{ background: #162130; border-color: #33465b; }}
+    QFrame#keyCard[sel="true"] {{ background: #1e2c3d; border: 1px solid {ACCENT_STRONG}; }}
+    QLabel#keyCardName {{ color: {FG}; font-size: 13px; font-weight: 650;
+                          background: transparent; }}
+    QLabel#keyCardVk {{ color: {DIM}; font-size: 10px; background: #0d1420;
+                        border: 1px solid {BORDER}; border-radius: 6px;
+                        padding: 2px 7px; }}
+    QFrame#chip {{ background: #0d1420; border: 1px solid {BORDER};
+                   border-radius: 8px; }}
+    QFrame#chip[on="true"] {{ background: #1a2534; border: 1px solid #3b526d; }}
+    QFrame#chip[hot="true"] {{ border: 1px solid {ACCENT_STRONG}; }}
+    QLabel#chipTitle {{ color: {DIM}; font-size: 10px; background: transparent; }}
+    QLabel#chipText {{ color: {FG}; font-size: 11px; background: transparent; }}
+    QLabel#chipText[dim] {{ color: #5b6878; }}
+
+    /* ---- 手势分段切换器(beta UI 翻新) ---- */
+    QPushButton#seg {{ background: #111821; color: {DIM}; border: 1px solid {BORDER};
+                       padding: 8px 6px; border-radius: 9px; font-size: 12px; }}
+    QPushButton#seg:hover {{ background: #182636; color: {FG}; }}
+    QPushButton#seg:checked {{ background: {ACCENT_STRONG}; color: white;
+                               border-color: #6a9dff; font-weight: 700; }}
+    QPushButton#seg:disabled {{ color: #4a5563; background: #0d1420; }}
     """
+
+
+class KeyCard(QtWidgets.QFrame):
+    """键位卡片(beta UI 翻新):键名 + 三手势胶囊,点击选中。
+
+    借鉴 RC003 设置页"每个按键一张卡片、卡片上直接看到已配动作"的形态。
+    """
+
+    clicked = QtCore.Signal(str)
+
+    _SLOT_TITLES = (("click", "单击"), ("double_click", "双击"), ("long_press", "长按"))
+
+    def __init__(self, key_name: str, parent=None):
+        super().__init__(parent)
+        self.key_name = key_name
+        self.setObjectName("keyCard")
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(7)
+
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(8)
+        self.lbl_name = QtWidgets.QLabel("")
+        self.lbl_name.setObjectName("keyCardName")
+        top.addWidget(self.lbl_name)
+        top.addStretch(1)
+        self.lbl_vk = QtWidgets.QLabel(key_name)
+        self.lbl_vk.setObjectName("keyCardVk")
+        top.addWidget(self.lbl_vk)
+        v.addLayout(top)
+
+        chips = QtWidgets.QHBoxLayout()
+        chips.setSpacing(6)
+        self._chip_texts: dict[str, QtWidgets.QLabel] = {}
+        for slot, title in self._SLOT_TITLES:
+            chip = QtWidgets.QFrame()
+            chip.setObjectName("chip")
+            cv = QtWidgets.QVBoxLayout(chip)
+            cv.setContentsMargins(8, 5, 8, 5)
+            cv.setSpacing(0)
+            t = QtWidgets.QLabel(title)
+            t.setObjectName("chipTitle")
+            t.setAlignment(QtCore.Qt.AlignCenter)
+            s = QtWidgets.QLabel("—")
+            s.setObjectName("chipText")
+            s.setProperty("dim", True)
+            s.setAlignment(QtCore.Qt.AlignCenter)
+            cv.addWidget(t)
+            cv.addWidget(s)
+            self._chip_texts[slot] = s
+            chips.addWidget(chip, 1)
+        v.addLayout(chips)
+
+    def mousePressEvent(self, ev):
+        self.clicked.emit(self.key_name)
+        super().mousePressEvent(ev)
+
+    def set_selected(self, selected: bool):
+        self.setProperty("sel", "true" if selected else "false")
+        st = self.style()
+        st.unpolish(self)
+        st.polish(self)
+
+    def update_content(self, label: str, slots: dict):
+        self.lbl_name.setText(label)
+        for slot, title in self._SLOT_TITLES:
+            action = slots[slot]
+            text_el = self._chip_texts[slot]
+            if action.get("type", "none") == "none":
+                text_el.setText("—")
+                text_el.setProperty("dim", True)
+            else:
+                text_el.setText(action_summary(action))
+                text_el.setProperty("dim", False)
+            st = text_el.style()
+            st.unpolish(text_el)
+            st.polish(text_el)
 
 
 class MiRemoteWindow(QtWidgets.QMainWindow):
@@ -507,16 +627,27 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         list_card.setObjectName("card")
         list_lay = QtWidgets.QVBoxLayout(list_card)
         list_lay.setContentsMargins(14, 16, 14, 14)
-        lbl = QtWidgets.QLabel("按键映射")
+        lbl = QtWidgets.QLabel("键位卡片")
         lbl.setObjectName("sectionTitle")
         list_lay.addWidget(lbl)
-        list_hint = QtWidgets.QLabel("选择一个按键开始编辑")
+        list_hint = QtWidgets.QLabel("点卡片编辑;胶囊显示每个手势已配的动作")
         list_hint.setObjectName("muted")
+        list_hint.setWordWrap(True)
         list_lay.addWidget(list_hint)
-        self.key_list = QtWidgets.QListWidget()
-        self.key_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.key_list.currentItemChanged.connect(self._on_select_key)
-        list_lay.addWidget(self.key_list, 1)
+
+        # 键位卡片墙(beta UI 翻新):替代裸列表,每键一张三手势卡片
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        cards_content = QtWidgets.QWidget()
+        self.key_cards_lay = QtWidgets.QVBoxLayout(cards_content)
+        self.key_cards_lay.setContentsMargins(2, 2, 6, 2)
+        self.key_cards_lay.setSpacing(8)
+        self.key_cards_lay.addStretch(1)
+        scroll.setWidget(cards_content)
+        list_lay.addWidget(scroll, 1)
+        self.key_cards: dict[str, KeyCard] = {}
+
         btn_learn = QtWidgets.QPushButton("学习新键")
         btn_learn.setObjectName("ghost")
         btn_learn.clicked.connect(self._learn_keys)
@@ -560,13 +691,34 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         form = QtWidgets.QGridLayout()
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(10)
+        gesture_label = QtWidgets.QLabel("手势")
+        gesture_label.setObjectName("muted")
+        form.addWidget(gesture_label, 0, 0)
+        # 手势分段切换器(beta UI 翻新):三个互斥按钮,选中即切槽
+        self.gesture_tabs = QtWidgets.QFrame()
+        tabs_lay = QtWidgets.QHBoxLayout(self.gesture_tabs)
+        tabs_lay.setContentsMargins(0, 0, 0, 0)
+        tabs_lay.setSpacing(6)
+        self._gesture_group = QtWidgets.QButtonGroup(self)
+        self._gesture_group.setExclusive(True)
+        self._gesture_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for _i, (_slot, _label) in enumerate(KeyCard._SLOT_TITLES):
+            b = QtWidgets.QPushButton(_label)
+            b.setCheckable(True)
+            b.setObjectName("seg")
+            self._gesture_group.addButton(b, _i)
+            self._gesture_buttons[_slot] = b
+            tabs_lay.addWidget(b, 1)
+        self._gesture_group.idClicked.connect(lambda _i: self._load_gesture_editor())
+        self._gesture_buttons["click"].setChecked(True)
+        form.addWidget(self.gesture_tabs, 0, 1)
         action_label = QtWidgets.QLabel("执行动作")
         action_label.setObjectName("muted")
-        form.addWidget(action_label, 0, 0)
+        form.addWidget(action_label, 1, 0)
         self.action_box = QtWidgets.QComboBox()
         self.action_box.addItems([p[0] for p in PRESETS])
         self.action_box.currentIndexChanged.connect(self._on_preset)
-        form.addWidget(self.action_box, 0, 1)
+        form.addWidget(self.action_box, 1, 1)
         right.addLayout(form)
 
         self.action_detail = QtWidgets.QLabel("")
@@ -820,25 +972,33 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self._append_log(f"识别模型已改为 {self.model_box.currentText()}")
 
     def _refresh_keys(self):
-        self.key_list.clear()
+        # 重建键位卡片墙(beta UI 翻新)
         keys = self.service.config.get("keys", {})
         self._key_names = sorted(k for k in keys if not k.startswith("_"))
+        while self.key_cards_lay.count() > 1:      # 末尾一位是 stretch
+            item = self.key_cards_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.key_cards.clear()
         for name in self._key_names:
             conf = keys[name]
-            summary = action_summary(conf.get("on_down", {"type": "none"}))
-            item = QtWidgets.QListWidgetItem(f"{conf.get('label', name)}    {summary}")
-            item.setData(QtCore.Qt.UserRole, name)
-            self.key_list.addItem(item)
-        if self.key_list.count():
-            selected_index = 0
-            if self.current_key:
-                for i in range(self.key_list.count()):
-                    if self.key_list.item(i).data(QtCore.Qt.UserRole) == self.current_key:
-                        selected_index = i
-                        break
-            self.key_list.setCurrentRow(selected_index)
+            card = KeyCard(name)
+            card.update_content(conf.get("label", name), key_slots(conf))
+            card.clicked.connect(self._select_key)
+            self.key_cards_lay.insertWidget(self.key_cards_lay.count() - 1, card)
+            self.key_cards[name] = card
+        target = self.current_key if self.current_key in self.key_cards else (
+            self._key_names[0] if self._key_names else None
+        )
         self._update_remote_state()
         self._render_status(self.service.status())
+        if target:
+            self._select_key(target)   # 同步高亮 + 编辑器,避免"高亮但未选中"
+
+    def _update_card_selection(self, name: str | None):
+        for k, card in self.key_cards.items():
+            card.set_selected(k == name)
 
     def _update_remote_state(self):
         bound = set()
@@ -853,9 +1013,9 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
             lbl = conf.get("label", "")
             display_label = "返回" if lbl.startswith("返回") else lbl
             if display_label in label_to_name:
-                if conf.get("on_down", {}).get("type") != "none":
+                if key_summary(conf) != "无操作":
                     bound.add(display_label)
-                labels[display_label] = action_summary(conf.get("on_down", {"type": "none"}))
+                labels[display_label] = key_summary(conf)
         self.remote.set_state(bound, labels)
 
     def _on_remote_click(self, name: str):
@@ -867,21 +1027,43 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self._append_log(f"点中了遥控器【{name}】，但配置里没有对应键，请用「学习新键」绑定")
 
     def _select_key(self, name: str):
+        if name not in self.service.config.get("keys", {}):
+            return
         self.current_key = name
-        for i in range(self.key_list.count()):
-            it = self.key_list.item(i)
-            if it.data(QtCore.Qt.UserRole) == name:
-                self.key_list.setCurrentItem(it)
-                break
         conf = self.service.config["keys"][name]
         self.edit_title.setText(f"编辑: {conf.get('label', name)}  ({name})")
-        action = conf.get("on_down", {"type": "none"})
+        slots = key_slots(conf)
+        self._pending_slots = slots
         self.selected_key_chip.setText(conf.get("label", name))
-        self.selected_key_title.setText(action_summary(action))
+        self.selected_key_title.setText(key_summary(conf))
         self.selected_key_meta.setText(f"{name} · 修改后点击“保存此键”")
+        self._update_card_selection(name)
+        # 语音键不进手势引擎:双击/长按置灰(与守护层旁路一致)
+        is_voice = slots["click"].get("type") == "voice"
+        for slot, btn in self._gesture_buttons.items():
+            btn.setEnabled(not is_voice or slot == "click")
+            btn.setToolTip(
+                "语音键固定为“按住说话”,不支持双击/长按"
+                if is_voice and slot != "click" else ""
+            )
+        self._gesture_buttons["click"].setChecked(True)
+        self._load_gesture_editor()
+
+    # ---- 三手势槽位编辑(beta) ----
+    def _current_gesture(self) -> str:
+        for slot, btn in self._gesture_buttons.items():
+            if btn.isChecked():
+                return slot
+        return "click"
+
+    def _load_gesture_editor(self):
+        """把当前手势槽的动作刷进动作下拉和 JSON 明细。"""
+        if not self.current_key or not hasattr(self, "_pending_slots"):
+            return
+        slot = self._current_gesture()
+        action = self._pending_slots.get(slot, {"type": "none"})
         self._pending_action = dict(action)
         self.action_detail.setText(json.dumps(action, ensure_ascii=False))
-        # 匹配预设
         matched = self._match_preset(action)
         for i in range(self.action_box.count()):
             if self.action_box.itemText(i) == matched:
@@ -889,11 +1071,6 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
                 self.action_box.setCurrentIndex(i)
                 self.action_box.blockSignals(False)
                 break
-
-    def _on_select_key(self, item, _prev):
-        if not item:
-            return
-        self._select_key(item.data(QtCore.Qt.UserRole))
 
     def _match_preset(self, action: dict) -> str:
         for label, a in PRESETS:
@@ -907,6 +1084,11 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
                 return label
         return "无操作"
 
+    def _commit_pending_to_slot(self):
+        """把动作选择器里尚未保存的最新编辑写入当前手势槽(防切换丢失)。"""
+        if hasattr(self, "_pending_action") and hasattr(self, "_pending_slots"):
+            self._pending_slots[self._current_gesture()] = dict(self._pending_action)
+
     def _on_preset(self, idx):
         label = self.action_box.itemText(idx)
         for l, preset in PRESETS:
@@ -916,6 +1098,7 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
                 else:
                     self._pending_action = dict(preset)
                     self.action_detail.setText(json.dumps(self._pending_action, ensure_ascii=False))
+                self._commit_pending_to_slot()
                 return
 
     def _handle_special(self, label: str):
@@ -938,15 +1121,24 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
                 self._pending_action = {"type": "run", "argv": shlex.split(cmd)}
         if hasattr(self, "_pending_action"):
             self.action_detail.setText(json.dumps(self._pending_action, ensure_ascii=False))
+        self._commit_pending_to_slot()
 
     def _save_key(self):
         if not self.current_key:
             QtWidgets.QMessageBox.information(self, "提示", "请先选择一个按键")
             return
-        action = getattr(self, "_pending_action", {"type": "none"})
-        self.service.config["keys"][self.current_key]["on_down"] = action
+        # 手势选择器里未提交的最新编辑先落进当前槽
+        self._commit_pending_to_slot()
+        conf = self.service.config["keys"][self.current_key]
+        slots = self._pending_slots
+        conf["click"] = dict(slots["click"])
+        conf["double_click"] = dict(slots["double_click"])
+        conf["long_press"] = dict(slots["long_press"])
+        conf["on_down"] = dict(slots["click"])   # 兼容镜像(老版本/学习器可读)
         self.service.save_config()
-        self._append_log(f"已保存 {self.current_key} -> {action_summary(action)}")
+        self._append_log(
+            f"已保存 {self.current_key} -> {key_summary(conf)}"
+        )
         self._refresh_keys()
 
     def _learn_keys(self):
