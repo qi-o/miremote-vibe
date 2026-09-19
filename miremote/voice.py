@@ -199,6 +199,25 @@ class StreamingLinearResampler:
         return output
 
 
+def _status_name(status) -> str:
+    name = getattr(status, "name", None)
+    if name:
+        return str(name)
+    text = str(status)
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def _status_ok(status) -> bool:
+    return _status_name(status).lower() in {"success", "ok"}
+
+
+def _ensure_gatt_success(status, operation: str):
+    if not _status_ok(status):
+        raise RuntimeError(f"{operation}失败: {_status_name(status)}")
+
+
 class AtvvClient:
     def __init__(self, addr: int = DEFAULT_ADDR):
         self.addr = addr
@@ -221,6 +240,10 @@ class AtvvClient:
         self._mic_open_future = None
         self._mic_open_requested = False
         self._capture_lock = threading.Lock()
+        self._closed = False
+        self._close_lock = threading.Lock()
+        self._disconnect_token = None
+        self._disconnect_event: asyncio.Event | None = None
         self.stream_id = 0x00
         self.stream_active = False
         self.stream_reason: int | None = None
@@ -237,6 +260,7 @@ class AtvvClient:
 
     async def connect(self):
         self._loop = asyncio.get_running_loop()
+        self._disconnect_event = asyncio.Event()
         if self.addr is None:
             from .blediscover import find_remote_addr
             self.addr = find_remote_addr()
@@ -247,9 +271,13 @@ class AtvvClient:
         self.dev = await BluetoothLEDevice.from_bluetooth_address_async(self.addr)
         if self.dev is None:
             raise RuntimeError("打不开 BLE 设备（蓝牙没连上？）")
+        self._install_connection_status_handler()
         svc_res = await self.dev.get_gatt_services_with_cache_mode_async(
             BluetoothCacheMode.UNCACHED
         )
+        status = getattr(svc_res, "status", None)
+        if status is not None:
+            _ensure_gatt_success(status, "发现 ATVV 服务")
         svc = None
         for s in svc_res.services:
             if str(s.uuid).lower() == UUID_SVC:
@@ -257,9 +285,13 @@ class AtvvClient:
                 break
         if svc is None:
             raise RuntimeError("设备上没有 AB5E0001 ATVV 服务")
+        self.svc = svc
         cr = await svc.get_characteristics_with_cache_mode_async(
             BluetoothCacheMode.UNCACHED
         )
+        status = getattr(cr, "status", None)
+        if status is not None:
+            _ensure_gatt_success(status, "发现 ATVV 特征")
         for ch in cr.characteristics:
             cu = str(ch.uuid).lower()
             if cu == UUID_TX:
@@ -273,21 +305,86 @@ class AtvvClient:
 
         # 订阅控制通道
         token = self.ctrl_ch.add_value_changed(self._on_ctrl)
-        self._tokens.append((self.ctrl_ch, token))
         from winrt.windows.devices.bluetooth.genericattributeprofile import (
             GattClientCharacteristicConfigurationDescriptorValue,
         )
-        st = await self.ctrl_ch.write_client_characteristic_configuration_descriptor_async(
-            GattClientCharacteristicConfigurationDescriptorValue.NOTIFY
-        )
+        try:
+            st = await self.ctrl_ch.write_client_characteristic_configuration_descriptor_async(
+                GattClientCharacteristicConfigurationDescriptorValue.NOTIFY
+            )
+            _ensure_gatt_success(st, "控制通道订阅")
+            self._tokens.append((self.ctrl_ch, token))
+        except BaseException:
+            try:
+                self.ctrl_ch.remove_value_changed(token)
+            except Exception:
+                pass
+            raise
         print(f"控制通道已订阅 (状态 {st})")
 
     async def write(self, data: bytes):
-        st = await self.tx.write_value_async(to_ibuffer(data))
+        st = await asyncio.wait_for(self.tx.write_value_async(to_ibuffer(data)), 10.0)
+        _ensure_gatt_success(st, "ATVV 写入")
         return st
 
+    def _install_connection_status_handler(self):
+        add = getattr(self.dev, "add_connection_status_changed", None)
+        if not callable(add):
+            return
+        self._disconnect_token = add(self._on_connection_status_changed)
+
+    def _on_connection_status_changed(self, sender, _args):
+        status = getattr(sender, "connection_status", None)
+        if _status_name(status).lower() != "disconnected":
+            return
+        self._signal_disconnected()
+
+    def _signal_disconnected(self):
+        if self._closed:
+            return
+        loop = self._loop
+        event = self._disconnect_event
+        if loop is None or loop.is_closed() or event is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass  # The owner loop may have finished during a late WinRT callback.
+
+    def disconnected_event(self) -> asyncio.Event:
+        if self._disconnect_event is None:
+            self._disconnect_event = asyncio.Event()
+        return self._disconnect_event
+
+    def connection_status(self) -> str:
+        if self.dev is None:
+            return "unknown"
+        return _status_name(getattr(self.dev, "connection_status", "unknown")).lower()
+
+    def is_disconnected(self) -> bool:
+        return self.connection_status() == "disconnected"
+
     def _on_ctrl(self, _sender, args):
+        if self._closed:
+            return
         data = ibuffer_bytes(args.characteristic_value)
+        self._dispatch_notification(self._handle_ctrl, data)
+
+    def _dispatch_notification(self, callback, data):
+        loop = self._loop
+        if self._closed:
+            return
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(callback, data)
+            except RuntimeError:
+                pass
+        else:
+            callback(data)
+
+    def _handle_ctrl(self, data):
+        if self._closed:
+            return
         self.events.append(("ctrl", data))
         op = data[0] if data else -1
         name = OPCODE_NAMES.get(op, f"UNKNOWN_0x{op:02X}")
@@ -384,9 +481,17 @@ class AtvvClient:
         except Exception as exc:
             self._mic_open_requested = False
             print(f"响应 MIC_OPEN 请求失败: {exc}")
+            self._signal_disconnected()
 
     def _on_audio(self, _sender, args):
+        if self._closed:
+            return
         data = ibuffer_bytes(args.characteristic_value)
+        self._dispatch_notification(self._handle_audio, data)
+
+    def _handle_audio(self, data):
+        if self._closed:
+            return
         with self._capture_lock:
             self.audio_frames.append(data)
             self.audio_items.append(("audio", data))
@@ -404,15 +509,24 @@ class AtvvClient:
     async def subscribe_audio(self):
         if self._audio_subscribed:
             return
-        self._audio_subscribed = True
         token = self.audio_ch.add_value_changed(self._on_audio)
-        self._tokens.append((self.audio_ch, token))
         from winrt.windows.devices.bluetooth.genericattributeprofile import (
             GattClientCharacteristicConfigurationDescriptorValue,
         )
-        st = await self.audio_ch.write_client_characteristic_configuration_descriptor_async(
-            GattClientCharacteristicConfigurationDescriptorValue.NOTIFY
-        )
+        try:
+            st = await self.audio_ch.write_client_characteristic_configuration_descriptor_async(
+                GattClientCharacteristicConfigurationDescriptorValue.NOTIFY
+            )
+            _ensure_gatt_success(st, "音频通道订阅")
+            self._tokens.append((self.audio_ch, token))
+            self._audio_subscribed = True
+        except BaseException:
+            self._audio_subscribed = False
+            try:
+                self.audio_ch.remove_value_changed(token)
+            except Exception:
+                pass
+            raise
         print(f"音频通道已订阅 (状态 {st})")
 
     async def mic_open(self):
@@ -446,18 +560,30 @@ class AtvvClient:
                     pass
                 self._tokens.remove((ch, token))
                 break
+        self._audio_subscribed = False
         try:
             none_v = getattr(CCCD, "NONE", None)
             if none_v is not None:
-                await self.audio_ch.write_client_characteristic_configuration_descriptor_async(none_v)
+                st = await self.audio_ch.write_client_characteristic_configuration_descriptor_async(none_v)
+                _ensure_gatt_success(st, "音频通知禁用")
         except Exception:
             pass
         await asyncio.sleep(0.18)
         token = self.audio_ch.add_value_changed(self._on_audio)
-        self._tokens.append((self.audio_ch, token))
-        st = await self.audio_ch.write_client_characteristic_configuration_descriptor_async(
-            CCCD.NOTIFY
-        )
+        try:
+            st = await self.audio_ch.write_client_characteristic_configuration_descriptor_async(
+                CCCD.NOTIFY
+            )
+            _ensure_gatt_success(st, "音频通知重订阅")
+            self._tokens.append((self.audio_ch, token))
+            self._audio_subscribed = True
+        except BaseException:
+            try:
+                self.audio_ch.remove_value_changed(token)
+            except Exception:
+                pass
+            self._audio_subscribed = False
+            raise
         print(f"音频通知已重订阅 (状态 {st})")
 
     def reset_capture(self):
@@ -601,11 +727,38 @@ class AtvvClient:
         return True
 
     async def close(self):
-        for ch, token in self._tokens:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.audio_stopped.set()
+        self.audio_started.set()
+        event = self._disconnect_event
+        if event is not None:
+            event.set()
+        if self._mic_open_future is not None:
+            self._mic_open_future.cancel()
+        remove_conn = getattr(self.dev, "remove_connection_status_changed", None)
+        if callable(remove_conn) and self._disconnect_token is not None:
+            try:
+                remove_conn(self._disconnect_token)
+            except Exception:
+                pass
+            self._disconnect_token = None
+        for ch, token in list(self._tokens):
             try:
                 ch.remove_value_changed(token)
             except Exception:
                 pass
+        self._tokens.clear()
+        self._audio_subscribed = False
+        for obj in (self.audio_ch, self.ctrl_ch, self.tx, getattr(self, "svc", None), self.dev):
+            close = getattr(obj, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 async def main_async():
@@ -823,6 +976,10 @@ class VoiceDaemon:
     由按键线程调用（线程安全）。转写在干净子进程里跑（见 transcribe_local）。
     """
 
+    CONNECT_TIMEOUT = 20.0
+    OPERATION_TIMEOUT = 15.0
+    RECONNECT_INITIAL = 2.0
+
     def __init__(self, on_text, log=print, model: str = "medium",
                  addr: int = DEFAULT_ADDR, mode: str = "local",
                  wechat_hotkey: str | None = None,
@@ -831,7 +988,8 @@ class VoiceDaemon:
                  toggle_hotkey: list[str] | None = None,
                  arm_suppression=None,
                  diagnostics: bool = False,
-                 diagnostics_root: Path | None = None):
+                 diagnostics_root: Path | None = None,
+                 on_event=None):
         self.on_text = on_text      # callable(text: str)
         self.log = log
         self.model = model
@@ -850,8 +1008,10 @@ class VoiceDaemon:
         self._clip_before: str | None = None  # 会话开始时的剪贴板快照
         self.diagnostics = diagnostics
         self.diagnostics_root = diagnostics_root
+        self.on_event = on_event
         self.loop: asyncio.AbstractEventLoop | None = None
         self._cmds: asyncio.Queue | None = None
+        self._stop_async: asyncio.Event | None = None
         self._ready = threading.Event()
         self._collecting = False
         self._stop = threading.Event()
@@ -884,6 +1044,13 @@ class VoiceDaemon:
         self._playback_lock = threading.Lock()  # v2 播放互斥（防并发写 CABLE）
         self._capture_frame_size = 120
         self._capture_meta = {}
+        self._connection_generation = 0
+        self._active_generation = 0
+        self._recovery_state = "idle"
+        self._recovery_attempt = 0
+        self._recovery_last_error = ""
+        self._recovery_session = 0
+        self._main_task = None
 
     # ---- 生命周期 ----
     def start(self) -> bool:
@@ -893,6 +1060,15 @@ class VoiceDaemon:
 
     def stop(self):
         self._stop.set()
+        loop = self.loop
+        stop_async = self._stop_async
+        if loop and stop_async is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(stop_async.set)
+                if self._main_task is not None:
+                    loop.call_soon_threadsafe(self._main_task.cancel)
+            except RuntimeError:
+                pass
         self._live_drain.set()
         self._live_started.set()
         self._stop_live_provider("守护停止")
@@ -901,9 +1077,9 @@ class VoiceDaemon:
                 self._tap_toggle_slow()
             except Exception:
                 pass
-        if self._thread:
+        if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
-        self._close_cable_stream()  # 常开流随守护退出统一关闭
+        self._close_cable_stream_when_idle()  # 常开流随守护退出统一关闭
 
     def _live2_panel_cleanup_needed(self) -> bool:
         return bool(self.live2 and self.mode == "wechat" and self._wetype_panel_visible())
@@ -916,13 +1092,48 @@ class VoiceDaemon:
         asyncio.run(self._main())
 
     async def _main(self):
+        self._main_task = asyncio.current_task()
+        try:
+            await self._run_loop()
+        except asyncio.CancelledError:
+            if not self._stop.is_set():
+                raise
+        finally:
+            self._active_generation = 0
+            self._ready.clear()
+            self._clear_voice_session()
+            self._recovery_state = "stopped"
+            self._emit_event("voice.stopped", session=self._recovery_session, ready=False)
+            self._main_task = None
+
+    async def _wait_disconnect(self, cli):
+        """Status-only fallback also wakes capture if Windows misses the event."""
+        while not cli.is_disconnected():
+            try:
+                await asyncio.wait_for(cli.disconnected_event().wait(), 1.0)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+    async def _run_loop(self):
         self.loop = asyncio.get_running_loop()
         self._cmds = asyncio.Queue()
+        self._stop_async = asyncio.Event()
+        backoff = self.RECONNECT_INITIAL
         while not self._stop.is_set():
             cli = AtvvClient(self.addr)
+            connected_at = 0.0
+            client_closed = False
+            self._connection_generation += 1
+            generation = self._connection_generation
+            self._active_generation = generation
+            self._recovery_session += 1
+            self._recovery_state = "connecting"
+            self._emit_event("voice.connecting", attempt=self._recovery_attempt,
+                             session=self._recovery_session, generation=generation)
             try:
-                await cli.connect()
-                resp = await cli.get_caps()
+                await asyncio.wait_for(cli.connect(), self.CONNECT_TIMEOUT)
+                resp = await asyncio.wait_for(cli.get_caps(), self.OPERATION_TIMEOUT)
                 if not resp:
                     raise RuntimeError("GET_CAPS 无响应")
                 caps = cli.parse_caps(resp)
@@ -938,26 +1149,63 @@ class VoiceDaemon:
                 # 触发的物理流（start_reason=0x03）有音频。言灵是"订阅常驻、
                 # mic_open 响应式"；miremote v1/v2 也是 begin 才 mic_open。
                 # 会话开始由 on_voice（LL 钩子判定）或音频帧自检触发。
-                await cli.subscribe_audio()
-                cli.on_audio_live = self._on_atvv_frame
-                cli.on_ctrl_live = self._on_atvv_ctrl
-                cli.on_stream_start_live = self._on_atvv_stream_start
-                cli.on_stream_stop_live = self._on_atvv_stream_stop
-                cli.on_codec_sync_live = self._on_atvv_codec_sync
+                await asyncio.wait_for(cli.subscribe_audio(), self.OPERATION_TIMEOUT)
+                if cli.is_disconnected():
+                    raise RuntimeError("ATVV 订阅完成时连接已断开")
+                connected_at = time.monotonic()
+                cli.on_audio_live = lambda frame, g=generation: self._if_current(g, self._on_atvv_frame, frame)
+                cli.on_ctrl_live = lambda data, g=generation: self._if_current(g, self._on_atvv_ctrl, data)
+                cli.on_stream_start_live = lambda data, g=generation: self._if_current(g, self._on_atvv_stream_start, data)
+                cli.on_stream_stop_live = lambda data, g=generation: self._if_current(g, self._on_atvv_stream_stop, data)
+                cli.on_codec_sync_live = lambda predictor, step_index, g=generation: self._if_current(
+                    g, self._on_atvv_codec_sync, predictor, step_index
+                )
                 self._ready.set()
+                self._recovery_state = "ready"
+                self._recovery_last_error = ""
+                self._emit_event(
+                    "voice.ready",
+                    attempt=self._recovery_attempt,
+                    session=self._recovery_session,
+                    generation=generation,
+                    ready=True,
+                    connected=True,
+                    subscribed=True,
+                    frame_size=cli.frame_size,
+                    protocol=cli.protocol_version,
+                )
                 # live2 不预开面板：切换式语音会话激活会切系统通信模式、
                 # 静音其他声音流（用户实测看视频无声）——面板必须用完即关，
                 # 每段在按下瞬间现开（F5 已被 LL 钩子吞，防误触不触发）。
                 while not self._stop.is_set():
+                    if cli.is_disconnected():
+                        raise RuntimeError("ATVV 连接已断开")
                     if not self._collecting:
                         # 空闲：等 begin 命令（on_voice / rawinput 兜底 / 帧自检）
+                        cmd_wait = asyncio.create_task(self._cmds.get())
+                        disconnect_wait = asyncio.create_task(self._wait_disconnect(cli))
+                        stop_wait = asyncio.create_task(self._stop_async.wait())
                         try:
-                            cmd = await asyncio.wait_for(self._cmds.get(), timeout=1.0)
-                        except asyncio.TimeoutError:
+                            done, _pending = await asyncio.wait(
+                                {cmd_wait, disconnect_wait, stop_wait},
+                                timeout=1.0,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            for t in (cmd_wait, disconnect_wait, stop_wait):
+                                if not t.done():
+                                    t.cancel()
+                            await asyncio.gather(cmd_wait, disconnect_wait, stop_wait, return_exceptions=True)
+                        if stop_wait in done:
+                            break
+                        if disconnect_wait in done:
+                            raise RuntimeError("ATVV 连接已断开")
+                        if not done:
                             if cli.audio_stopped.is_set():
                                 # 游离短流的结束信号：清掉，避免下次误判
                                 cli.audio_stopped.clear()
                             continue
+                        cmd = cmd_wait.result()
                         if cmd == "prepare_live":
                             await self._prepare_live_session(cli)
                         elif cmd == "begin":
@@ -969,8 +1217,10 @@ class VoiceDaemon:
                     # 与用户复现的固定 1.9s 对上。该模式有 RawInput up 兜底。
                     stop_wait = asyncio.create_task(cli.audio_stopped.wait())
                     cmd_wait = asyncio.create_task(self._cmds.get())
+                    disconnect_wait = asyncio.create_task(self._wait_disconnect(cli))
+                    stop_daemon_wait = asyncio.create_task(self._stop_async.wait())
                     dog = None
-                    wait_set = {stop_wait, cmd_wait}
+                    wait_set = {stop_wait, cmd_wait, disconnect_wait, stop_daemon_wait}
                     if self.mode != "wechat" or self.live:
                         dog = asyncio.create_task(asyncio.sleep(2.0))
                         wait_set.add(dog)
@@ -981,9 +1231,16 @@ class VoiceDaemon:
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     finally:
-                        for t in (stop_wait, cmd_wait, dog):
+                        for t in (stop_wait, cmd_wait, disconnect_wait, stop_daemon_wait, dog):
                             if t is not None and not t.done():
                                 t.cancel()
+                        await asyncio.gather(*wait_set, return_exceptions=True)
+                    if stop_daemon_wait in done:
+                        self._clear_voice_session()
+                        break
+                    if disconnect_wait in done:
+                        self._clear_voice_session()
+                        raise RuntimeError("ATVV 连接已断开")
                     should_end = stop_wait in done
                     if cmd_wait in done and not should_end:
                         command = cmd_wait.result()
@@ -1001,17 +1258,105 @@ class VoiceDaemon:
                         self.log("(会话开启但 2 秒无音频，结束)")
                         should_end = True
                     if should_end:
-                        await self._end_session(cli)
+                        await asyncio.wait_for(self._end_session(cli), self.OPERATION_TIMEOUT)
             except Exception as e:
+                self._clear_voice_session()
                 self._ready.clear()
-                self.log(f"语音连接断开/出错({type(e).__name__}: {e})，2 秒后重连…")
+                self._active_generation = 0
+                self._recovery_state = "reconnecting"
+                self._recovery_last_error = f"{type(e).__name__}: {e}"
+                if connected_at and time.monotonic() - connected_at >= 10.0:
+                    self._recovery_attempt = 0
+                    backoff = self.RECONNECT_INITIAL
+                else:
+                    self._recovery_attempt += 1
+                delay = backoff
+                self.log(f"语音连接断开/出错({type(e).__name__}: {e})，{delay:.0f} 秒后重连…")
+                self._emit_event(
+                    "voice.disconnected",
+                    attempt=self._recovery_attempt,
+                    session=self._recovery_session,
+                    generation=generation,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    state=self._recovery_state,
+                    connected=False,
+                    ready=False,
+                    collecting=self._collecting,
+                )
                 try:
-                    await cli.close()
-                    if cli.dev is not None:
-                        cli.dev.close()
-                except Exception:
+                    await asyncio.wait_for(cli.close(), 2.0)
+                except Exception as cleanup_error:
+                    self._emit_event("voice.cleanup_failed", error=str(cleanup_error))
+                client_closed = True
+                if self._stop.is_set():
+                    break
+                self._emit_event(
+                    "voice.retry",
+                    attempt=self._recovery_attempt,
+                    session=self._recovery_session,
+                    generation=generation,
+                    delay=delay,
+                    retry_in=delay,
+                )
+                try:
+                    await asyncio.wait_for(self._stop_async.wait(), delay)
+                except asyncio.TimeoutError:
                     pass
-                await asyncio.sleep(2)
+                backoff = min(30.0, backoff * 2.0)
+            finally:
+                if self._active_generation == generation:
+                    self._active_generation = 0
+                if not client_closed:
+                    try:
+                        await asyncio.wait_for(cli.close(), 2.0)
+                    except Exception as cleanup_error:
+                        self._emit_event("voice.cleanup_failed", error=str(cleanup_error))
+
+    def _emit_event(self, event_name: str, **fields):
+        callback = self.on_event
+        if callback is None:
+            return
+        clean = {}
+        for key, value in fields.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                clean[key] = value[:4096] if key == "error" and isinstance(value, str) else value
+        try:
+            callback(event_name, **clean)
+        except Exception:
+            pass
+
+    def recovery_status(self) -> dict:
+        return {
+            "state": self._recovery_state,
+            "attempt": self._recovery_attempt,
+            "last_error": self._recovery_last_error,
+            "session": self._recovery_session,
+        }
+
+    def _if_current(self, generation: int, callback, *args):
+        if generation != self._active_generation or self._stop.is_set():
+            return None
+        return callback(*args)
+
+    def _clear_voice_session(self):
+        self._collecting = False
+        self._live_drain.set()
+        self._live_started.set()
+        self._live_ready.clear()
+        self._live_active = False
+        self._live_armed = False
+        self._live_q = None
+        self._live_prelude = []
+        self._live_request_at = 0.0
+        self._capture_meta = {}
+        q = self._cmds
+        if q is not None:
+            while True:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
     # ---- ATVV 常驻回调（winrt 线程） ----
     def _on_atvv_ctrl(self, data: bytes):
@@ -1199,6 +1544,8 @@ class VoiceDaemon:
             "stream_id": cli.stream_id,
             "codec": cli.selected_codec,
         }
+        self._recovery_state = "recording"
+        self._emit_event("voice.recording", state="recording", session=self._recovery_session)
         # RC003 的 START_SEARCH 响应由 AtvvClient 处理；会话 begin 只负责
         # 建立本地收集边界，绝不能再次主动 MIC_OPEN。
         if self.mode == "wechat" and self.live:
@@ -1224,11 +1571,11 @@ class VoiceDaemon:
             pass
         # 固件 2671：MIC_CLOSE 后音频通知订阅失效（下一段收不到流），
         # 按言灵 REOPEN RESET 序列重订阅恢复
-        try:
-            await cli.resubscribe_audio()
-        except Exception:
-            pass
+        await cli.resubscribe_audio()
         self._last_session_end = time.monotonic()
+        self._recovery_state = "ready"
+        self._emit_event("voice.capture_done", state="ready", session=self._recovery_session,
+                         frames=sum(1 for item in frames if not isinstance(item, tuple) or item[0] == "audio"))
         has_audio = any(
             not isinstance(x, tuple) or (x and x[0] == "audio")
             for x in frames
@@ -1381,6 +1728,9 @@ class VoiceDaemon:
             )
             text = transcribe_local(wav_path, model_name=self.model)
             if text:
+                if self._stop.is_set():
+                    self.log("(守护已停止，丢弃迟到转写结果)")
+                    return
                 self.log(f"识别: {text}")
                 self.on_text(text)
             else:
@@ -1802,6 +2152,9 @@ class VoiceDaemon:
                 time.sleep(0.1)
         full_text = text
         if text:
+            if self._stop.is_set():
+                self.log("live2: 守护已停止，丢弃迟到文本")
+                return
             time.sleep(0.15)  # 等焦点稳定
             self._paste_text()
             # 记录完整文本（非增量），供下一段做前缀对比
@@ -1838,7 +2191,10 @@ class VoiceDaemon:
             return
         toggle_started = False
         live2_toggle = False
+        hold_started = False
         try:
+            if self._stop.is_set():
+                return
             pcm, stats, metrics = self._decode_session(frames, meta)
             if not pcm:
                 self.log("(音频为空)")
@@ -1852,6 +2208,8 @@ class VoiceDaemon:
             self.log(message)
             if diagnostic_path is not None:
                 self.log(f"诊断 WAV: {diagnostic_path}")
+            if self._stop.is_set():
+                return
             if self.live2 or self.live:
                 # 实时系（live2/开发版）回退：切换式开面板（与主路径同一套
                 # 动作）；非实时稳定版保持按住式原行为
@@ -1866,8 +2224,11 @@ class VoiceDaemon:
                     return
             else:
                 # 稳定版：按住式 down→播放→up（松手后空闲注入，已验证）
-                self._press_hotkey(down=True)
-            time.sleep(0.45)                 # 等输入法麦克风就绪
+                if not self._press_hotkey(down=True):
+                    raise RuntimeError("微信语音热键发送失败")
+                hold_started = True
+            if self._stop.wait(self.ready_delay):
+                return
             if not self._ensure_cable_stream():
                 if live2_toggle:
                     self._toggle_close_and_paste(None)
@@ -1877,6 +2238,7 @@ class VoiceDaemon:
                     toggle_started = False
                 else:
                     self._press_hotkey(down=False)
+                    hold_started = False
                 return
             # 重采样并播放
             import struct as _s
@@ -1896,8 +2258,14 @@ class VoiceDaemon:
                 out.append(int(prev + (cur - prev) * fr) if i == 0
                            else int(cur + (nxt - cur) * fr))
                 prev = float(cur)
-            self._cable_stream.write(_s.pack(f"<{len(out)}h", *out))
-            time.sleep(0.35)                 # 尾音播完
+            data = _s.pack(f"<{len(out)}h", *out)
+            chunk_bytes = max(2, int(rate * 0.05) * 2)
+            for offset in range(0, len(data), chunk_bytes):
+                if self._stop.is_set():
+                    return
+                self._cable_stream.write(data[offset:offset + chunk_bytes])
+            if self._stop.wait(0.35):
+                return
             if live2_toggle:
                 # live2 回退：切换式收尾（与主路径一致：关面板+收割+粘贴）
                 from . import actions as _act
@@ -1914,6 +2282,7 @@ class VoiceDaemon:
                 toggle_started = False
             else:
                 self._press_hotkey(down=False)  # 松开 -> 输入法识别上屏
+                hold_started = False
             self.log("已交由微信识别（去语气词/整理）")
         except Exception as e:
             import traceback
@@ -1927,12 +2296,19 @@ class VoiceDaemon:
                     toggle_started = False
                 else:
                     self._press_hotkey(down=False)   # 异常时尽力松开热键
+                    hold_started = False
                 if self._cable_stream is None:
                     pass  # 常开流：仅在写失败时已置空，无需处理
             except Exception:
                 pass
         finally:
-            self._playback_lock.release()
+            try:
+                if hold_started:
+                    self._press_hotkey(down=False)
+                if self._stop.is_set():
+                    self._close_cable_stream()
+            finally:
+                self._playback_lock.release()
 
     def _close_cable_stream(self):
         st = getattr(self, "_cable_stream", None)
@@ -1943,6 +2319,16 @@ class VoiceDaemon:
             except Exception:
                 pass
             self._cable_stream = None
+
+    def _close_cable_stream_when_idle(self):
+        acquired = self._playback_lock.acquire(timeout=2.0)
+        if not acquired:
+            self.log("CABLE 流仍在播放，跳过本次关闭以避免并发关闭")
+            return
+        try:
+            self._close_cable_stream()
+        finally:
+            self._playback_lock.release()
 
     def _ensure_cable_stream(self):
         """CABLE 输出流常开复用（服务生命周期内不关，写失败自动置空重开）。

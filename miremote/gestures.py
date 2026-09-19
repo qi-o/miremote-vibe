@@ -221,23 +221,31 @@ class GestureDispatcher:
     def _schedule(self, button: str, table: Dict[str, object],
                   delay: float, timeout) -> None:
         self._cancel(table, button)
-        t = self._timer_factory(delay, lambda: timeout(button))
+        timer_ref: Dict[str, object] = {}
+        t = self._timer_factory(delay, lambda: timeout(button, timer_ref.get("timer")))
+        timer_ref["timer"] = t
         table[button] = t
         t.start()
 
     def _schedule_repeat(self, button: str, delay: float) -> None:
         self._cancel(self._repeat_timers, button)
-        t = self._timer_factory(delay, lambda: self._repeat_timeout(button))
+        timer_ref: Dict[str, object] = {}
+        t = self._timer_factory(delay, lambda: self._repeat_timeout(button, timer_ref.get("timer")))
+        timer_ref["timer"] = t
         self._repeat_timers[button] = t
         t.start()
 
-    def _double_timeout(self, button: str) -> None:
+    def _double_timeout(self, button: str, timer: object) -> None:
         with self._lock:
+            if self._double_timers.get(button) is not timer:
+                return
             self._double_timers.pop(button, None)
             self._run(self._rec.double_timed_out(button))
 
-    def _long_timeout(self, button: str) -> None:
+    def _long_timeout(self, button: str, timer: object) -> None:
         with self._lock:
+            if self._long_timers.get(button) is not timer:
+                return
             self._long_timers.pop(button, None)
             self._run(self._rec.long_timed_out(button))
             # 长按连发:动作可重复且仍按住时,按节律继续触发
@@ -254,8 +262,10 @@ class GestureDispatcher:
                 pass
         return (self.REPEAT_DELAY_SECONDS, self.REPEAT_INTERVAL_SECONDS)
 
-    def _repeat_timeout(self, button: str) -> None:
+    def _repeat_timeout(self, button: str, timer: object) -> None:
         with self._lock:
+            if self._repeat_timers.get(button) is not timer:
+                return
             if button not in self._immediate_held:
                 self._repeat_timers.pop(button, None)
                 return

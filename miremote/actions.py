@@ -138,7 +138,8 @@ def set_clipboard_text(text: str) -> bool:
 
 def type_text(text: str):
     """把文本写进当前焦点窗口（剪贴板 + Ctrl+V）。注意会覆盖剪贴板。"""
-    set_clipboard_text(text)
+    if not set_clipboard_text(text):
+        raise RuntimeError("剪贴板写入失败，已取消粘贴")
     time.sleep(0.03)
     send_combo(["VK_CONTROL", "VK_V"])
 

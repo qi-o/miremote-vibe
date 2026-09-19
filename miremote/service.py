@@ -10,12 +10,14 @@ import os
 import sys
 import threading
 import time
+import copy
 from pathlib import Path
 
 from . import actions
 from .gestures import GestureDispatcher, Trigger
 from .keys import name_to_vk, vk_name
 from .rawinput import RawInputEngine
+from . import runtime
 
 
 # ---- 三手势槽位(beta 新增)----
@@ -49,24 +51,16 @@ def key_summary(entry: dict) -> str:
 
 
 def realtime_dev_build() -> bool:
-    if _env_bool("MIREMOTE_REALTIME_DEV"):
-        return True
-    return bool(
-        getattr(sys, "frozen", False)
-        and any(
-            marker in Path(sys.executable).stem
-            for marker in ("实时实验版", "实时输入开发版")
-        )
-    )
+    return runtime.realtime_dev_build()
+
+
+def recovery_build() -> bool:
+    return runtime.recovery_build()
 
 
 def app_data_dir() -> Path:
     """配置/日志/模型的用户目录（打包后 exe 目录可能只读）。"""
-    if getattr(sys, "frozen", False):
-        base = os.environ.get("APPDATA", str(Path.home()))
-        name = "MiRemoteVibe-RealtimeDev" if realtime_dev_build() else "MiRemoteVibe"
-        return Path(base) / name
-    return Path(__file__).resolve().parent.parent
+    return runtime.app_data_dir(Path(__file__).resolve().parent.parent)
 
 
 def config_path() -> Path:
@@ -81,7 +75,7 @@ def _env_bool(name: str):
 
 
 def _apply_env_overrides(cfg: dict) -> dict:
-    if realtime_dev_build():
+    if realtime_dev_build() and not recovery_build():
         cfg["voice_mode"] = "wechat"
         cfg["wechat_live"] = True
         cfg["wechat_hotkey"] = ["VK_CONTROL", "VK_LWIN", "VK_SHIFT"]
@@ -99,7 +93,31 @@ def _apply_env_overrides(cfg: dict) -> dict:
     auto_start = _env_bool("MIREMOTE_AUTO_START_SERVICE")
     if auto_start is not None:
         cfg["auto_start_service"] = auto_start
+    if recovery_build():
+        cfg["auto_start_service"] = False
+        cfg["hide_tray"] = False
+        cfg["wechat_live"] = False
+        cfg["wechat_live2"] = False
+    if runtime.release_build():
+        cfg["wechat_live"] = False
+        cfg["wechat_live2"] = False
     return cfg
+
+
+def stable_gui_mutex_exists() -> bool:
+    return runtime.stable_gui_mutex_exists()
+
+
+def tap_listener_busy(port: int = runtime.TAP_LISTENER_PORT) -> bool:
+    return runtime.tap_listener_busy(port)
+
+
+def candidate_conflict_reason() -> str | None:
+    return runtime.candidate_conflict_reason()
+
+
+def _config_clone(value):
+    return copy.deepcopy(value)
 
 
 DEFAULT_CONFIG = {
@@ -212,25 +230,27 @@ class MiRemoteService:
         self._llhook = None
         self._gestures: GestureDispatcher | None = None
         self._leak = None
+        self._recovery_log = self._open_recovery_log()
+        self._recovery_log_warned = False
 
     # ---- 配置 ----
     def _load_config(self) -> dict:
         p = config_path()
-        if not p.exists() and realtime_dev_build():
-            stable = Path(os.environ.get("APPDATA", str(Path.home()))) / "MiRemoteVibe" / "config.json"
+        if not p.exists() and (recovery_build() or realtime_dev_build()):
+            stable = runtime.stable_app_data_dir() / "config.json"
             if stable.exists():
                 p = stable
         if p.exists():
             try:
                 cfg = json.loads(p.read_text(encoding="utf-8"))
                 for k, v in DEFAULT_CONFIG.items():
-                    cfg.setdefault(k, v)
+                    cfg.setdefault(k, _config_clone(v))
                 # 迁移：热键归一到 Ctrl+Win 两键按住式（旧三键切换式会触发两个录音）
                 if cfg.get("wechat_hotkey") != DEFAULT_CONFIG["wechat_hotkey"]:
                     cfg["wechat_hotkey"] = list(DEFAULT_CONFIG["wechat_hotkey"])
                 # 迁移：补齐后来新增的按键映射（老配置里没有的键）
                 for k, v in DEFAULT_CONFIG["keys"].items():
-                    cfg.setdefault("keys", {}).setdefault(k, json.loads(json.dumps(v)))
+                    cfg.setdefault("keys", {}).setdefault(k, _config_clone(v))
                 # 迁移：移除幽灵静音键（RC003 实体没有这个键，usage 0x7F 从未出现）
                 cfg.setdefault("keys", {}).pop("TAP_VOLUME_MUTE", None)
                 # 迁移：修正 learn 阶段标错的 VK_HOME 标签
@@ -240,7 +260,32 @@ class MiRemoteService:
                 return _apply_env_overrides(cfg)
             except (json.JSONDecodeError, OSError):
                 pass
-        return _apply_env_overrides(json.loads(json.dumps(DEFAULT_CONFIG)))
+        return _apply_env_overrides(_config_clone(DEFAULT_CONFIG))
+
+    def _open_recovery_log(self):
+        if not (recovery_build() or runtime.release_build()):
+            return None
+        try:
+            from .eventlog import RecoveryLog
+            return RecoveryLog(app_data_dir() / "logs" / "voice-recovery.jsonl")
+        except Exception as e:
+            self.on_log(f"恢复日志不可用: {e}")
+            return None
+
+    def _record_event(self, event_name: str, **fields):
+        if self._recovery_log is None:
+            return
+        try:
+            ok = self._recovery_log.record(event_name, **fields)
+        except Exception:
+            ok = False
+        if not ok and not self._recovery_log_warned:
+            self._recovery_log_warned = True
+            self.on_log("恢复日志写入失败，后续恢复事件只在界面显示")
+
+    def _voice_event(self, event_name: str, **fields):
+        self._record_event(event_name, **fields)
+        self._emit_status()
 
     def _start_f5_hook_if_needed(self, eng: RawInputEngine):
         dev = self.config.get("device", {})
@@ -269,27 +314,54 @@ class MiRemoteService:
             self.on_log(f"F5 吞键不可用: {e}")
 
     def save_config(self, cfg: dict | None = None):
-        if cfg is not None:
-            self.config = cfg
+        next_config = cfg if cfg is not None else self.config
         p = config_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.config, ensure_ascii=False, indent=2),
-                     encoding="utf-8")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(next_config, ensure_ascii=False, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        self.config = next_config
 
     # ---- 生命周期 ----
     def start(self) -> bool:
         with self._lock:
             if self.running:
                 return True
+            conflict = candidate_conflict_reason()
+            if conflict is not None:
+                self.on_log(f"恢复候选版未启动守护：检测到稳定版或 Gadget 通道占用 ({conflict})")
+                self._record_event("service.busy", reason=conflict, pid=os.getpid())
+                if self._recovery_log is not None:
+                    self._recovery_log.close()
+                self._emit_status()
+                return False
             try:
+                self._record_event("service.start", pid=os.getpid())
                 self._start_inner()
             except Exception as e:
                 self.on_log(f"启动失败: {e}")
+                self._record_event(
+                    "service.failure",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    pid=os.getpid(),
+                )
                 import traceback
                 self.on_log(traceback.format_exc())
                 self._cleanup()
                 return False
             self.running = True
+            self._record_event("service.started", pid=os.getpid())
             self._emit_status()
             return True
 
@@ -322,21 +394,24 @@ class MiRemoteService:
                     self.on_log(f"语音已输入: {text}")
 
                 mode = self.config.get("voice_mode", "local")
-                vd = VoiceDaemon(
-                    on_text=on_text, log=lambda m: self.on_log(f"[语音] {m}"),
-                    model=self.config.get("voice_model", "medium"),
-                    mode=mode,
-                    wechat_hotkey=self.config.get("wechat_hotkey"),
-                    live=self.config.get("wechat_live", True),
-                    live2=self.config.get("wechat_live2", False),
-                    toggle_hotkey=self.config.get("wechat_toggle_hotkey"),
-                    arm_suppression=lambda: bool(
+                voice_kwargs = {
+                    "on_text": on_text,
+                    "log": lambda m: self.on_log(f"[语音] {m}"),
+                    "model": self.config.get("voice_model", "medium"),
+                    "mode": mode,
+                    "wechat_hotkey": self.config.get("wechat_hotkey"),
+                    "live": self.config.get("wechat_live", True),
+                    "live2": self.config.get("wechat_live2", False),
+                    "toggle_hotkey": self.config.get("wechat_toggle_hotkey"),
+                    "arm_suppression": lambda: bool(
                         self._tap and self._tap.arm_voice_suppression(2000)
                     ),
-                    ready_delay=self.config.get("wechat_ready_delay", 0.45),
-                    diagnostics=self.config.get("voice_diagnostics", False),
-                    diagnostics_root=app_data_dir() / "diagnostics",
-                )
+                    "ready_delay": self.config.get("wechat_ready_delay", 0.45),
+                    "diagnostics": self.config.get("voice_diagnostics", False),
+                    "diagnostics_root": app_data_dir() / "diagnostics",
+                }
+                voice_kwargs["on_event"] = self._voice_event
+                vd = VoiceDaemon(**voice_kwargs)
                 self._voice = vd
                 if vd.start():
                     if mode == "wechat":
@@ -431,9 +506,14 @@ class MiRemoteService:
     def stop(self):
         with self._lock:
             if not self.running:
+                if self._recovery_log is not None:
+                    self._recovery_log.close()
                 return
             self._cleanup()
             self.running = False
+            self._record_event("service.stop", pid=os.getpid())
+            if self._recovery_log is not None:
+                self._recovery_log.close()
             self._emit_status()
 
     def _cleanup(self):
@@ -473,6 +553,7 @@ class MiRemoteService:
             except Exception:
                 pass
             self._leak = None
+        self._held.clear()
 
     # ---- 按键处理 ----
     def _run_action_dict(self, action: dict, label: str, source: str):
@@ -555,12 +636,27 @@ class MiRemoteService:
 
     # ---- 状态 ----
     def status(self) -> dict:
-        return {
+        st = {
             "running": self.running,
             "voice_ready": bool(self._voice and self._voice.ready),
             "tap_ready": self._tap is not None,
             "key_count": len(self.config.get("keys", {})),
         }
+        if runtime.release_build():
+            st["recovery_log"] = str(app_data_dir() / "logs" / "voice-recovery.jsonl")
+        if recovery_build():
+            st["recovery_build"] = True
+            st["recovery_log"] = str(app_data_dir() / "logs" / "voice-recovery.jsonl")
+            st["candidate_conflict"] = None if self.running else candidate_conflict_reason()
+        recovery_status = getattr(self._voice, "recovery_status", None) if self._voice else None
+        if callable(recovery_status):
+            try:
+                voice_recovery = recovery_status()
+            except Exception:
+                voice_recovery = None
+            if isinstance(voice_recovery, dict):
+                st["voice_recovery"] = voice_recovery
+        return st
 
     def _emit_status(self):
         if self.on_status:

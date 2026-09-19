@@ -1,5 +1,9 @@
 # miremote-vibe
 
+**2026-09-19 · v1.3.1**：新增 ATVV 语音自动恢复、持久化诊断日志与日用/候选构建；恢复原首页介绍图。详见 [更新说明](docs/VOICE_RECOVERY_1_3_1.md) 与 [Changelog](CHANGELOG.md)。
+
+**v1.3.1** adds ATVV reconnection, recovery diagnostics and explicit build profiles, and restores the original control-page image. Long-running hardware recovery still requires validation.
+
 **把 65 块的小米蓝牙遥控器 2 Pro，变成 Windows 上的 vibe coding 遥控器。**
 
 躺在沙发上，按住遥控器语音键对 AI 编程助手说话，松手后文字自动打进终端；
@@ -25,7 +29,7 @@ adjust volume.
 >
 > **发布目的**：发布出来只是希望给大家一个参考，尤其是给 Windows 系统下
 > 想要使用小米蓝牙遥控器硬件做类似事情的人提供参考——这里的设备协议逆向、
-> 蓝牙语音解码、被系统丢弃按键的救回方案，全网目前没有现成的 Windows 实现。
+> 蓝牙语音解码、被系统丢弃按键的救回方案，记录了本机验证过的 Windows 实现。
 >
 > **交流意愿**：这是我自己 vibe coding 出来的一个小玩具，分享出来纯粹是
 > 希望它记录的技术方案能帮到遇到同样问题的人。**大概率不会有后期维护**——
@@ -40,8 +44,8 @@ adjust volume.
 > **Why published**: Shared purely as a reference, especially for people on
 > Windows who want to hack on this Xiaomi remote hardware — the protocol
 > reverse engineering, Bluetooth voice decoding, and recovery of keys silently
-> dropped by the Windows driver have no existing open-source Windows
-> implementation that we know of.
+> dropped by the Windows driver are documented here with an implementation
+> tested on the author's Windows setup.
 >
 > **Community**: This is a little toy I vibe-coded for myself, shared purely
 > in the hope that the documented solutions help someone hitting the same
@@ -54,7 +58,7 @@ adjust volume.
 
 ## 中文目录
 
-- [功能一览](#功能一览全部真机验证)
+- [功能与验证范围](#功能与验证范围)
 - [它是怎么工作的](#它是怎么工作的)
 - [快速开始](#快速开始)
 - [键位配置 v2](#键位配置-v2三手势--连发)
@@ -65,7 +69,7 @@ adjust volume.
 
 ## English Contents
 
-- [Features](#features-verified-on-real-hardware)
+- [Features](#features-and-validation-scope)
 - [How It Works](#how-it-works)
 - [Quick Start](#quick-start)
 - [Key Configuration v2](#key-configuration-v2--three-gestures--hold-to-repeat)
@@ -78,7 +82,7 @@ adjust volume.
 
 # 中文
 
-## 功能一览（全部真机验证）
+## 功能与验证范围
 
 | 功能 | 说明 |
 |---|---|
@@ -90,8 +94,9 @@ adjust volume.
 | 本地语音 | 按住说话→松手→ATVV 蓝牙协议解码→faster-whisper 本地转写→文字粘贴（全离线） |
 | 微信语音模式 | 松手后整段音频桥接给微信输入法识别（自动去语气词、整理语句）；需 VB-CABLE + 在微信输入法里把语音麦克风设为 CABLE Output、"按住说话"快捷键设为 Ctrl+Alt+V |
 | Qt GUI | 按键映射可视化编辑（键位卡片墙 + 三手势槽 + 点遥控器图绑键）+ 语音模式切换 + 日志 + 系统托盘 |
-| 回归测试 | 27 项 pytest（哑键协议/Gadget 协商/语音链路）+ 37 项手势引擎断言（`tests/`） |
-| 开机自启 | 静默后台启动 + 自动启动守护 |
+| 回归测试 | 73 项 pytest（含语音恢复、配置、日志与发布身份）+ 37 项手势引擎断言（`tests/`） |
+| 开机自启 | 日用版支持静默登录启动 + 自动启动守护；候选版固定手动启动 |
+| 语音连接恢复 | 失败状态检查、断线检测、旧会话清理、退避重试；长期真机恢复仍需验证 |
 
 > 状态：2026-08-29 tap4 稳定版。语音链路大坑已修（会话开始**不再主动发
 > MIC_OPEN**——固件 2671 上主动开麦会触发一条无声的"主机流"，把按住语音键
@@ -139,11 +144,11 @@ python -m miremote app
 ### 打包 exe
 
 ```bat
-:: 可选：哑键拦截需要 Frida Gadget（约 7MB，仓库不含二进制）
+:: 完整功能构建必需：哑键拦截需要 Frida Gadget（约 7MB，仓库不含二进制）
 curl -L -o assets\frida-gadget-17.15.3-windows-x86_64.dll.xz ^
   https://github.com/frida/frida/releases/download/17.15.3/frida-gadget-17.15.3-windows-x86_64.dll.xz
 
-pyinstaller miremote.spec --noconfirm
+powershell -NoProfile -File tools\build_release.ps1
 ```
 
 ## 键位配置 v2（三手势 + 连发）
@@ -364,7 +369,7 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 
 # English
 
-## Features (verified on real hardware)
+## Features and validation scope
 
 | Feature | Notes |
 |---|---|
@@ -376,8 +381,9 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 | Local voice | Hold-to-talk → release → ATVV Bluetooth decode → faster-whisper local transcription → paste (fully offline) |
 | WeChat voice mode | After release, the whole utterance is bridged to WeType IME recognition (auto-removes filler words); requires VB-CABLE, WeType mic set to CABLE Output, and WeType's hold-to-talk hotkey set to Ctrl+Alt+V |
 | Qt GUI | Visual key remapping (key cards + three-gesture slots + click-the-remote binding) + voice mode switch + log + system tray |
-| Regression tests | 27 pytest cases (dead-key protocol / Gadget negotiation / voice chain) + 37 gesture-engine assertions (`tests/`) |
-| Boot autostart | Silent background start + service auto-launch |
+| Regression tests | 73 pytest cases (including recovery, config, logs and build identity) + 37 gesture-engine assertions (`tests/`) |
+| Boot autostart | Daily build supports silent login start and service auto-launch; candidate stays manual |
+| Voice recovery | GATT result checks, disconnect handling, cleanup and backoff; long-duration hardware validation remains pending |
 
 > Status: tap4 stable, 2026-08-29. The big voice-chain bug is fixed: sessions
 > **no longer send MIC_OPEN proactively** — on firmware 2671 a proactive
@@ -435,11 +441,11 @@ then start the service. Full walkthrough in [docs/使用说明.md](docs/使用�
 ### Build the exe
 
 ```bat
-:: Optional: dead-key recovery needs the Frida Gadget (~7MB, not committed)
+:: Required for complete builds: dead-key recovery needs the Frida Gadget (~7MB, not committed)
 curl -L -o assets\frida-gadget-17.15.3-windows-x86_64.dll.xz ^
   https://github.com/frida/frida/releases/download/17.15.3/frida-gadget-17.15.3-windows-x86_64.dll.xz
 
-pyinstaller miremote.spec --noconfirm
+powershell -NoProfile -File tools\build_release.ps1
 ```
 
 ## Key Configuration v2 (three gestures + hold-to-repeat)

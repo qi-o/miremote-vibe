@@ -1,5 +1,7 @@
 # AGENT GUIDE：项目技术档案与改进指南
 
+> 2026-09-19 更新：v1.3.1 的恢复流程、构建身份、日志和验证范围以 [语音恢复说明](VOICE_RECOVERY_1_3_1.md) 为准。下文保留早期调试事实，旧版本状态不可作为新功能真机验收依据。
+
 > **English note**: This is the Chinese agent/engineer handoff guide — code
 > structure, hard-coded protocol facts (ATVV UUIDs, opcodes, HID usage table,
 > registry-based device discovery), the must-read pitfall list (§5), build/test
@@ -61,7 +63,7 @@ miremote/
 ## 3. 硬编码技术事实（实测，勿凭感觉改）
 
 ### 设备
-- VID 2717 / PID 32B8；固件 2671；蓝牙 MAC C0:5D:39:C2:BE:B8
+- VID 2717 / PID 32B8；固件 2671；蓝牙地址由运行时自动发现，不在文档中记录个人设备地址
 - 设备路径两种格式：BTHLE `VID&012717_PID&32b8` / USB `VID_2717`，过滤正则要兼容
 - 按键→VK：方向=UP/DOWN/LEFT/RIGHT、OK=RETURN、语音=F5(scan 0x3F)、
   TV=0xC0、电源=0xFF、主页=HOME、菜单=APPS
@@ -145,4 +147,4 @@ pyinstaller miremote.spec --noconfirm
 
 ---
 
-*最后更新：2026-08-24。文档与代码同步，改代码请同步更新此文档。*
+*早期技术记录：2026-08-24；当前版本说明更新于 2026-09-19。*

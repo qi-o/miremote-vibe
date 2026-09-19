@@ -332,6 +332,29 @@ def backkey_main():
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "app"
+    if cmd == "--runtime-check":
+        from . import runtime_check
+        raise SystemExit(runtime_check.main())
+    from .runtime import recovery_build, release_build, candidate_conflict_reason
+    if (recovery_build() or release_build()) and cmd == "run":
+        # The recovery candidate shares GUI configuration and recovery wiring.
+        from .service import MiRemoteService
+        svc = MiRemoteService()
+        try:
+            if svc.start():
+                while svc.running:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            svc.stop()
+        return
+    if recovery_build() and cmd in {"devices", "voice", "learn", "selftest", "diagnose", "backkey"}:
+        # Local transcription subprocesses do not claim the remote device.
+        if not (cmd == "voice" and "--transcribe" in sys.argv):
+            conflict = candidate_conflict_reason()
+            if conflict:
+                raise SystemExit(conflict)
     table = {
         "devices": cmd_devices,
         "voice": voice_main,

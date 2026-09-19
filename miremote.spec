@@ -23,12 +23,17 @@ os.environ['PATH'] = os.pathsep.join(
 
 _datas = [('assets/remote.jpg', 'assets')]
 _build_name = os.environ.get('MIREMOTE_BUILD_NAME', '小米遥控器')
+_release = os.environ.get('MIREMOTE_BUILD_PROFILE') == 'release'
+if _release and _build_name != '小米遥控器':
+    raise RuntimeError('release profile requires stable build name 小米遥控器')
 # Frida Gadget 压缩包：exe 里哑键拦截（返回/音量）的必需资产。
 # 仓库不含该二进制（约 7MB），下载后放 assets/ 即自动打包：
 # https://github.com/frida/frida/releases/download/17.15.3/frida-gadget-17.15.3-windows-x86_64.dll.xz
 _gadget = 'assets/frida-gadget-17.15.3-windows-x86_64.dll.xz'
 if os.path.exists(_gadget):
     _datas.append((_gadget, 'assets'))
+elif _release or '语音恢复候选版' in _build_name:
+    raise RuntimeError('恢复候选版缺少必需的 Frida Gadget 资源，停止构建')
 _datas = [*_datas, *faster_whisper_datas]
 
 a = Analysis(
@@ -72,10 +77,15 @@ a = Analysis(
         # 三手势引擎与泄漏抑制(2026-09 键位系统)
         'miremote.gestures',
         'miremote.leaksup',
+        'miremote.eventlog',
+        'miremote.runtime',
+        'miremote.runtime_check',
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=(['tools/recovery_release_hook.py'] if _release else
+                   ['tools/recovery_runtime_hook.py']
+                   if '语音恢复候选版' in _build_name else []),
     excludes=['tkinter', 'pystray', 'PIL._tkinter_finder'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

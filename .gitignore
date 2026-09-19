@@ -14,3 +14,16 @@ assets/frida-gadget-*.dll.xz
 # 本地环境
 .venv/
 *.log
+# Local review, packaging and deployment artifacts (not public source)
+audit/
+candidate/
+release/
+build-*/
+.pytest_cache/
+deploy-backups/
+diagnostics/
+*.adpcm
+notes.md
+task_plan.md
+deployment-plan.md
+tools/deploy_release.py

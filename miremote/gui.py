@@ -19,9 +19,10 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import actions
+from . import runtime
 from .remote_widget import RemoteWidget, KEY_RECTS
 from .service import (MiRemoteService, SLOT_LABELS, action_summary,
-                      key_slots, key_summary, realtime_dev_build)
+                      key_slots, key_summary, realtime_dev_build, recovery_build)
 
 # ---- 深色主题调色板 ----
 BG = "#0d1117"
@@ -39,21 +40,32 @@ YELLOW = "#e8bd6a"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _REALTIME_DEV = realtime_dev_build()
-_WINDOW_TITLE = "小米遥控器 · 实时实验版" if _REALTIME_DEV else "小米遥控器 · 控制台"
+_RECOVERY_BUILD = recovery_build()
+_RELEASE_BUILD = runtime.release_build()
+_WINDOW_TITLE = (
+    runtime.RECOVERY_TITLE if _RECOVERY_BUILD
+    else ("小米遥控器 · 实时实验版" if _REALTIME_DEV else "小米遥控器 · 控制台")
+)
 _SINGLE_INSTANCE_MUTEX = (
-    "Local\\MiRemoteVibe.RealtimeDev.Gui" if _REALTIME_DEV
-    else "Local\\MiRemoteVibe.Gui"
+    runtime.RECOVERY_GUI_MUTEX if _RECOVERY_BUILD
+    else (runtime.REALTIME_GUI_MUTEX if _REALTIME_DEV else runtime.STABLE_GUI_MUTEX)
 )
 # 二次启动的唤回信号文件（第一实例监听其所在目录，第二实例创建它）
 import tempfile as _tempfile
 _SHOW_FLAG = str(
     Path(_tempfile.gettempdir()).resolve()
-    / ("miremote_realtime_dev_show.flag" if _REALTIME_DEV else "miremote_show.flag")
+    / (
+        runtime.RECOVERY_SHOW_FLAG_NAME if _RECOVERY_BUILD
+        else ("miremote_realtime_dev_show.flag" if _REALTIME_DEV else "miremote_show.flag")
+    )
 )
 
 # 开机自启注册表（当前用户，无需管理员）
 _BOOT_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_BOOT_RUN_NAME = "MiRemoteVibe-RealtimeDev" if _REALTIME_DEV else "MiRemoteVibe"
+_BOOT_RUN_NAME = (
+    runtime.RECOVERY_BOOT_NAME if _RECOVERY_BUILD
+    else ("MiRemoteVibe-RealtimeDev" if _REALTIME_DEV else "MiRemoteVibe")
+)
 
 
 def _show_existing_window_native() -> bool:
@@ -106,6 +118,8 @@ def _boot_launch_command() -> str:
 
 
 def _boot_launch_enabled() -> bool:
+    if _RECOVERY_BUILD:
+        return False
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _BOOT_RUN_KEY) as k:
@@ -116,6 +130,8 @@ def _boot_launch_enabled() -> bool:
 
 
 def _set_boot_launch(enable: bool) -> bool:
+    if _RECOVERY_BUILD:
+        return False
     try:
         import winreg
         if enable:
@@ -586,13 +602,19 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         # 打开时自动启动守护
         self.chk_autostart_service = QtWidgets.QCheckBox("打开时自动启动守护")
         self.chk_autostart_service.setChecked(
-            self.service.config.get("auto_start_service", True))
+            self.service.config.get("auto_start_service", not _RECOVERY_BUILD))
+        if _RECOVERY_BUILD:
+            self.chk_autostart_service.setEnabled(False)
+            self.chk_autostart_service.setToolTip("语音恢复候选版固定手动启动，避免影响稳定版")
         self.chk_autostart_service.toggled.connect(self._on_autostart_service)
         right.addWidget(self.chk_autostart_service)
 
         # 开机自启（静默）
         self.chk_boot_launch = QtWidgets.QCheckBox("开机自动启动（后台静默运行）")
         self.chk_boot_launch.setChecked(_boot_launch_enabled())
+        if _RECOVERY_BUILD:
+            self.chk_boot_launch.setEnabled(False)
+            self.chk_boot_launch.setToolTip("语音恢复候选版不写入开机自启")
         self.chk_boot_launch.toggled.connect(self._on_boot_launch)
         right.addWidget(self.chk_boot_launch)
         lay.addWidget(guide, 2)
@@ -837,8 +859,12 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self.live_box = QtWidgets.QCheckBox("实时输入（实验）")
         self.live_box.setChecked(bool(self.service.config.get("wechat_live", False)))
         self.live_box.setEnabled(
-            self.service.config.get("voice_mode") == "wechat" and not realtime_dev_build()
+            self.service.config.get("voice_mode") == "wechat"
+            and not realtime_dev_build()
+            and not (_RECOVERY_BUILD or _RELEASE_BUILD)
         )
+        if _RECOVERY_BUILD or _RELEASE_BUILD:
+            self.live_box.setToolTip("语音恢复版本固定关闭实时实验模式")
         if realtime_dev_build():
             self.live_box.setToolTip("实时实验版固定开启；稳定版仍使用松手播放")
         self.live_box.toggled.connect(self._on_live_change)
@@ -875,6 +901,12 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self.btn_clear_log.clicked.connect(lambda: self.log_text.clear())
         toolbar.addWidget(self.btn_clear_log)
         lay.addLayout(toolbar)
+        if _RECOVERY_BUILD or _RELEASE_BUILD:
+            log_path = self.service.status().get("recovery_log", "")
+            path_label = QtWidgets.QLabel(f"结构化恢复日志: {log_path}")
+            path_label.setObjectName("muted")
+            path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            lay.addWidget(path_label)
         self.log_text = QtWidgets.QPlainTextEdit()
         self.log_text.setReadOnly(True)
         lay.addWidget(self.log_text)
@@ -902,10 +934,19 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
 
     # ---- 自动启动 ----
     def _on_autostart_service(self, checked: bool):
+        if _RECOVERY_BUILD:
+            self.service.config["auto_start_service"] = False
+            self.service.save_config()
+            return
         self.service.config["auto_start_service"] = checked
         self.service.save_config()
 
     def _on_boot_launch(self, checked: bool):
+        if _RECOVERY_BUILD:
+            self.chk_boot_launch.blockSignals(True)
+            self.chk_boot_launch.setChecked(False)
+            self.chk_boot_launch.blockSignals(False)
+            return
         ok = _set_boot_launch(checked)
         if not ok:
             QtWidgets.QMessageBox.warning(self, "开机自启", "写注册表失败，未能设置开机自启。")
@@ -940,6 +981,8 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
     # ---- 逻辑 ----
     def _voice_desc(self) -> str:
         mode = self.service.config.get("voice_mode")
+        if _RECOVERY_BUILD:
+            return "语音恢复候选版：使用独立配置目录，实时实验模式固定关闭；启动守护前会避让稳定版和 Gadget 通道。"
         if mode == "wechat":
             if self.service.config.get("wechat_live", False):
                 return (
@@ -953,13 +996,24 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self.service.config["voice_mode"] = self.mode_box.currentData()
         if hasattr(self, "live_box"):
             self.live_box.setEnabled(
-                self.mode_box.currentData() == "wechat" and not realtime_dev_build()
+                self.mode_box.currentData() == "wechat"
+                and not realtime_dev_build()
+                and not (_RECOVERY_BUILD or _RELEASE_BUILD)
             )
         self.service.save_config()
         self.voice_desc.setText(self._voice_desc())
         self._append_log(f"语音模式已切换为 {self.mode_box.currentData()}（需重启守护）")
 
     def _on_live_change(self, checked: bool):
+        if _RECOVERY_BUILD or _RELEASE_BUILD:
+            self.service.config["wechat_live"] = False
+            self.service.config["wechat_live2"] = False
+            self.service.save_config()
+            self.live_box.blockSignals(True)
+            self.live_box.setChecked(False)
+            self.live_box.blockSignals(False)
+            self.voice_desc.setText(self._voice_desc())
+            return
         self.service.config["wechat_live"] = bool(checked)
         self.service.save_config()
         self.voice_desc.setText(self._voice_desc())
@@ -1157,11 +1211,21 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
 
     def _do_start(self):
         if not self.service.start():
-            self._append_log("启动失败，见日志")
+            self.log_signal.message.emit("启动失败，见日志")
 
     def _render_status(self, st: dict):
         if st.get("running"):
-            self.status_badge.setText("● 运行中")
+            voice_recovery = st.get("voice_recovery") if isinstance(st.get("voice_recovery"), dict) else {}
+            recovery_state = voice_recovery.get("state")
+            if recovery_state in {"connecting", "reconnecting", "recording"}:
+                label = {
+                    "connecting": "● 语音连接中",
+                    "reconnecting": "● 语音重连中",
+                    "recording": "● 录音中",
+                }[recovery_state]
+                self.status_badge.setText(label)
+            else:
+                self.status_badge.setText("● 运行中")
             self.status_badge.setStyleSheet(
                 f"color: {GREEN}; font-size: 16px; font-weight: 700;"
             )
@@ -1170,9 +1234,15 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
             if st.get("voice_ready"):
                 self.status_hint.setText("按键监听 · 语音已就绪")
             else:
-                self.status_hint.setText("按键监听 · 语音连接中…")
+                last_error = ""
+                voice_recovery = st.get("voice_recovery")
+                if isinstance(voice_recovery, dict):
+                    last_error = voice_recovery.get("last_error") or ""
+                self.status_hint.setText(
+                    f"按键监听 · 语音连接中… {last_error}".strip()
+                )
         else:
-            self.status_badge.setText("● 已停止")
+            self.status_badge.setText("● 候选版已停止" if st.get("recovery_build") else "● 已停止")
             self.status_badge.setStyleSheet(
                 f"color: {RED}; font-size: 16px; font-weight: 700;"
             )
