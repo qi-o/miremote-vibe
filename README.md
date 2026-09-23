@@ -88,13 +88,16 @@ adjust volume.
 |---|---|
 | 按键捕获 | 方向/OK/主页/菜单/TV/电源/语音键，Raw Input 按设备过滤（不影响物理键盘） |
 | **按键三手势** | **每键独立配置单击/双击/长按**（双击 300ms 等待窗、长按 550ms；未配手势的键零延迟立即触发） |
-| **按住连发** | "按一个键"类动作按住自动连发（350ms 首延迟 + 100ms 节律，均可用 `repeat_delay`/`repeat_interval` 调整）——返回键按住就是连续退格；长按槽触发后按住同样持续连发 |
-| **语义动作** | 显示桌面 / 右键菜单 / Alt+Tab / 媒体控制 / 打开或聚焦应用（窗口聚焦 → 注册表 App Paths → 开始菜单快捷方式 三级解析） |
-| **哑键救回** | **返回/音量±的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（tap4 协议：并发连接防护 + 控制握手，macOS 项目也没有的能力） |
+| **按住连发（Mac 节律表）** | **返回 50ms、方向/音量± 100ms**（对齐 Mac 原版 HIDRemoteScheduler），其余键一次性语义；`repeat`/`repeat_delay`/`repeat_interval` 可显式覆盖——返回键按住就是 50ms 连续退格 |
+| **身份映射对冲（v2.0）** | 配置动作 == 该键原生键时跳过注入（透传语义下原生动作已进 OS），消灭双响应——OK 配"回车"不再双回车 |
+| **语义动作** | 显示桌面 / 右键菜单 / Alt+Tab / 媒体控制 / 打开或聚焦应用（窗口聚焦 → App Paths → 开始菜单 三级解析）/ **鼠标滚轮·点击·移动（v2.0）** |
+| **哑键救回** | **返回/音量±的报文被 Windows 驱动丢弃**，本项目用 Frida Gadget 注入 WUDFHost 取回（tap4 协议：并发连接防护 + 控制握手；SayAll 交叉研究独立印证：RC003 无 RAWHID 设备，此为 Windows 上唯一公开途径） |
 | 本地语音 | 按住说话→松手→ATVV 蓝牙协议解码→faster-whisper 本地转写→文字粘贴（全离线） |
 | 微信语音模式 | 松手后整段音频桥接给微信输入法识别（自动去语气词、整理语句）；需 VB-CABLE + 在微信输入法里把语音麦克风设为 CABLE Output、"按住说话"快捷键设为 Ctrl+Alt+V |
+| **微信实时模式 rt（v2.0）** | **按下实时出字复活**：左 Ctrl+左 Win 按住和弦 + 键间 80ms 间隔注入（失败回滚防粘键）+ F5 钩子链头 bump。配方来自 SayAll 交叉研究的两项实证——WeType 拒零间隔批量注入、F5 夹在和弦中整组被拒——推翻了 live2 复盘"输入法只认硬件键"的假设 |
+| 指数退避重连（v2.0） | 语音链路断线 2s→×2→封顶 30s 重试，成功归零（纯逻辑单测覆盖） |
 | Qt GUI | 按键映射可视化编辑（键位卡片墙 + 三手势槽 + 点遥控器图绑键）+ 语音模式切换 + 日志 + 系统托盘 |
-| 回归测试 | 73 项 pytest（含语音恢复、配置、日志与发布身份）+ 37 项手势引擎断言（`tests/`） |
+| 回归测试 | pytest（哑键协议/Gadget 协商/语音链路/v2.0 升级专项）+ 41 项手势引擎断言（`tests/`）+ GitHub Actions CI |
 | 开机自启 | 日用版支持静默登录启动 + 自动启动守护；候选版固定手动启动 |
 | 语音连接恢复 | 失败状态检查、断线检测、旧会话清理、退避重试；长期真机恢复仍需验证 |
 
@@ -104,6 +107,13 @@ adjust volume.
 > 失效也已按言灵的 REOPEN RESET 序列修复。
 > **2026-09-14 键位系统升级**：新增每键三手势（单击/双击/长按）、按住连发
 > （含长按连发，返回键=按住连续退格）、语义动作层与键位卡片墙 UI。
+> **v2.0（2026-09-23）SayAll 交叉研究驱动的架构升级**：对同硬件的独立实现
+> [SayAll 无线麦 Windows 版](https://github.com/GetSayAll/remote-mic-app-windows)
+> 做了一轮全面交叉研究，吸收其真机实证结论与工程制度——完整档案见
+> **[docs/SayAll交叉研究-2026-09.md](docs/SayAll交叉研究-2026-09.md)**（含
+> "哪些明确不吸收及理由"）。工程制度同步落地：`AGENTS.md`（协作边界）、
+> `Bugs/`（根因档案制度）、`Testing/手测清单.md`（deferred/passed 真机验收
+> 状态机）、`telemetry.py`（结构化日志）、GitHub Actions CI。
 
 ## 它是怎么工作的
 
@@ -320,12 +330,24 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
       尝试时间线/方法论教训/可复用遗产）见
       [docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md](docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md)**；
       dormant 代码（`MIREMOTE_REALTIME_DEV`）与诊断探针在仓库内，欢迎新思路
+- [x] **按下实时出字（v2.0 wechat_rt 复活）**：SayAll 交叉研究给出两项新实证
+      （WeType 拒零间隔批量注入、F5 夹和弦即拒），推翻了 live2 复盘的
+      "输入法只认硬件键"假设——80ms 间隔注入 + F5 链头 bump 即可。**注意：
+      本项真机验收 deferred（见 Testing/手测清单.md），单测与配方已就绪**
+- [ ] wechat_rt 真机验收与参数微调（gap/面板就绪延迟）
 - [ ] 多遥控器/其他型号支持（需 learn 模式采集 usage 表）
 
 ## 致谢与许可
 
 ### 参考项目
 
+- **[GetSayAll/remote-mic-app-windows（无线麦 SayAll Windows 版）](https://github.com/GetSayAll/remote-mic-app-windows)**（GPL-3.0）
+  同硬件（RC001/RC003）的独立实现（Rust + Tauri 2），其公开的 Bugs/ 根因档案
+  与受控实验方法论是本项目 v2.0 的直接驱动：WeType 实时语音配方（80ms 间隔
+  注入 + F5 链头 bump）、"physicalize 是结构性 no-op"与"RC003 无 RAWHID 设备"
+  两项独立印证、ConsentStore 麦克风观测法、工程制度（Bugs 档案/deferred
+  状态机/AGENTS 边界）。完整交叉研究见
+  [docs/SayAll交叉研究-2026-09.md](docs/SayAll交叉研究-2026-09.md)。
 - **[richlearntodo-debug/vibe-flow（言灵 Vibe Flow）](https://github.com/richlearntodo-debug/vibe-flow)**（GPL-3.0）
   同代际的 Windows 遥控器 vibe coding 工具（C#/.NET），功能更完整、有安装器和持续维护：
   连续听写（主机流 + 8 秒 MIC_EXTEND 心跳，实测通过 15 分钟长听写）、微信/系统语音/
@@ -375,13 +397,16 @@ RC003 的确认/Home/TV 键与笔记本 Enter/Home/~ 的 VK+扫描码完全相�
 |---|---|
 | Button capture | D-pad / OK / Home / Menu / TV / Power / Voice via Raw Input, filtered by device (physical keyboard untouched) |
 | **Three gestures per key** | **Independent single-click / double-click / long-press per button** (300 ms double-click window, 550 ms long-press; keys without a configured gesture stay zero-latency) |
-| **Hold-to-repeat** | "Tap-a-key" actions auto-repeat while held (350 ms initial delay + 100 ms cadence, both tunable via `repeat_delay`/`repeat_interval`) — hold Back for continuous backspace; a fired long-press also keeps repeating while held |
-| **Semantic actions** | Show desktop / context menu / Alt+Tab / media keys / open-or-focus app (three-level resolution: window focus → registry App Paths → Start-Menu shortcut) |
-| **Dead-key recovery** | **Back / Volume± HID reports are silently dropped by the Windows driver** — recovered by injecting a Frida Gadget into WUDFHost (tap4 protocol: concurrent-connection guard + control handshake; not even the macOS projects do this) |
+| **Hold-to-repeat (Mac cadence table)** | **Back 50 ms, D-pad / Volume± 100 ms** (aligned with the Mac-original HIDRemoteScheduler); one-shot semantics for the rest — `repeat`/`repeat_delay`/`repeat_interval` still override. Hold Back = 50 ms continuous backspace |
+| **Identity-mapping offset (v2.0)** | When a configured action equals the button's native key, injection is skipped (passthrough already delivered it) — kills the double-response |
+| **Semantic actions** | Show desktop / context menu / Alt+Tab / media keys / open-or-focus app (three-level resolution: window focus → registry App Paths → Start-Menu shortcut) / **mouse wheel · click · move (v2.0)** |
+| **Dead-key recovery** | **Back / Volume± HID reports are silently dropped by the Windows driver** — recovered by injecting a Frida Gadget into WUDFHost (tap4 protocol: concurrent-connection guard + control handshake). Cross-research with SayAll independently confirms RC003 exposes no RAWHID device — this is the only public route on Windows |
 | Local voice | Hold-to-talk → release → ATVV Bluetooth decode → faster-whisper local transcription → paste (fully offline) |
 | WeChat voice mode | After release, the whole utterance is bridged to WeType IME recognition (auto-removes filler words); requires VB-CABLE, WeType mic set to CABLE Output, and WeType's hold-to-talk hotkey set to Ctrl+Alt+V |
+| **WeChat realtime mode rt (v2.0)** | **Press-to-text resurrected**: left Ctrl+left Win held chord + 80 ms inter-key spaced injection (with rollback) + F5 chain-head bump. Recipe from the SayAll cross-research — WeType rejects zero-gap batched chords and any chord with F5 wedged inside, overturning the live2 postmortem's "IME only trusts hardware keys" assumption |
+| Exponential backoff reconnect (v2.0) | Voice link retries 2 s → ×2 → cap 30 s, reset on success (pure-logic unit tested) |
 | Qt GUI | Visual key remapping (key cards + three-gesture slots + click-the-remote binding) + voice mode switch + log + system tray |
-| Regression tests | 73 pytest cases (including recovery, config, logs and build identity) + 37 gesture-engine assertions (`tests/`) |
+| Regression tests | pytest suite (dead-key protocol / Gadget / voice / v2.0 specifics) + 41 gesture-engine assertions (`tests/`) + GitHub Actions CI |
 | Boot autostart | Daily build supports silent login start and service auto-launch; candidate stays manual |
 | Voice recovery | GATT result checks, disconnect handling, cleanup and backoff; long-duration hardware validation remains pending |
 

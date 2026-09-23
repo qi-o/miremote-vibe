@@ -165,20 +165,50 @@ from miremote.service import MiRemoteService
 
 svc = MiRemoteService.__new__(MiRemoteService)
 svc.config = {"keys": {
-    "TAP_BACK": {"on_down": {"type": "tap", "key": "VK_BACK"}},          # tap -> 自动连发
+    "TAP_BACK": {"on_down": {"type": "tap", "key": "VK_BACK"}},          # 节律表:返回 50ms
+    "VK_UP": {"click": {"type": "tap", "key": "VK_UP"}},                 # 节律表:方向 100ms
+    "VK_HOME": {"click": {"type": "tap", "key": "VK_HOME"}},             # 不在表->不连发
     "VK_F5": {"on_down": {"type": "voice"}},                              # 语音 -> 永不
     "VK_X": {"click": {"type": "keys", "combo": ["VK_CONTROL", "VK_C"]}},  # 组合键 -> 默认不连发
     "VK_Y": {"click": {"type": "tap", "key": "VK_A"}, "repeat": False},    # 显式关
     "VK_Z": {"click": {"type": "keys", "combo": ["VK_CONTROL", "VK_Z"]},
              "repeat": True, "repeat_interval": 50, "repeat_delay": 200},  # 显式开+节律
 }}
-check("repeat-tap-auto", svc._slot_repeatable("TAP_BACK"))
+check("repeat-table-back", svc._slot_repeatable("TAP_BACK"))
+check("repeat-table-arrow", svc._slot_repeatable("VK_UP"))
+check("repeat-table-off-for-once-keys", not svc._slot_repeatable("VK_HOME"))
 check("repeat-voice-never", not svc._slot_repeatable("VK_F5"))
 check("repeat-keys-default-off", not svc._slot_repeatable("VK_X"))
 check("repeat-explicit-off-overrides", not svc._slot_repeatable("VK_Y"))
 check("repeat-explicit-on", svc._slot_repeatable("VK_Z"))
 check("repeat-timing-custom", svc._repeat_timing("VK_Z") == (0.2, 0.05))
-check("repeat-timing-default", svc._repeat_timing("TAP_BACK") == (0.35, 0.1))
+check("repeat-timing-table", svc._repeat_timing("TAP_BACK") == (0.35, 0.05)
+      and svc._repeat_timing("VK_UP") == (0.35, 0.1))
+
+# 10b) v2.0 身份映射对冲:单击动作==该键原生 VK 时跳过注入(透传语义下
+# 原生动作已进 OS,再注入=双响应)。monkeypatch perform 防止真注入。
+from miremote.gestures import Trigger as _Trig
+import miremote.actions as _actions_mod
+
+svc2 = MiRemoteService.__new__(MiRemoteService)
+svc2.config = {"keys": {
+    "VK_RETURN": {"click": {"type": "tap", "key": "VK_RETURN"}},   # 身份映射 -> 对冲
+    "VK_HOME": {"click": {"type": "tap", "key": "VK_RETURN"}},     # 非身份 -> 照常注入
+}}
+logged: list = []
+svc2.on_log = lambda msg: logged.append(msg)
+svc2._voice = None
+fired: list = []
+_orig_perform = _actions_mod.perform
+_actions_mod.perform = lambda a: (fired.append(a), "injected")[1]
+try:
+    svc2._fire_gesture("VK_RETURN", _Trig.CLICK)
+    check("identity-offset-skips-inject",
+          any("对冲" in m for m in logged) and not fired)
+    svc2._fire_gesture("VK_HOME", _Trig.CLICK)
+    check("non-identity-still-injects", len(fired) == 1)
+finally:
+    _actions_mod.perform = _orig_perform
 
 # 11) 引擎层:自定义节律生效(200ms 首延迟 + 50ms 间隔)
 clock = FakeClock()

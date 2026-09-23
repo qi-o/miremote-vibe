@@ -74,6 +74,100 @@ def send_combo(names: list[str], hold_last_ms: int = 30):
             _tap(vk, up=True)
 
 
+def hold_chord_spaced(names: list[str], gap_ms: float = 80.0,
+                      down: bool = True) -> bool:
+    """按下/松开一个"按住式"和弦,键与键之间留时间间隔。
+
+    依据 SayAll 2026-09-04 受控实验(A/B/AB 交替):WeType 拒绝零间隔批量注入的
+    和弦,逐事件、间隔 80ms 才被接受;任一键发送失败时尽力回滚已送达键,
+    保证按住的热键不粘死。down=False 时按相反顺序松开(同样间隔)。
+    """
+    vks = [name_to_vk(n) for n in names]
+    if not vks:
+        return False
+    if not down:
+        vks = list(reversed(vks))
+    delivered: list[int] = []
+    for index, vk in enumerate(vks):
+        if index > 0 and gap_ms > 0:
+            time.sleep(gap_ms / 1000.0)
+        if not _tap(vk, up=not down):
+            # 回滚:把已送达的键反向释放,不留粘键。
+            for sent in reversed(delivered):
+                _tap(sent, up=down)
+            return False
+        delivered.append(vk)
+    return True
+
+
+# ---- 鼠标动作(v2.0,对齐 SayAll 的 Scroll/MouseClick/MouseMove 功能面) ----
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_WHEEL = 0x0800
+
+
+def _mouse(flags: int, dx: int = 0, dy: int = 0, wheel: int = 0) -> bool:
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.union.mi.dx = dx
+    inp.union.mi.dy = dy
+    inp.union.mi.mouseData = wheel
+    inp.union.mi.dwFlags = flags
+    return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
+
+
+def validate_amount(value: int, maximum: int) -> int:
+    """滚轮格数/移动像素的合法域校验(1..=maximum);越界抛 ValueError。"""
+    if not 1 <= value <= maximum:
+        raise ValueError(f"数值须在 1..={maximum}: {value}")
+    return value
+
+
+def scroll(direction: str, steps: int = 1) -> str:
+    """滚轮:direction="up"/"down",每次 1..=100 格(格数≠像素)。"""
+    steps = validate_amount(int(steps), 100)
+    wheel = steps if direction == "up" else -steps
+    ok = _mouse(MOUSEEVENTF_WHEEL, wheel=wheel)
+    return f"滚轮{'上' if direction == 'up' else '下'} {steps} 格" + ("" if ok else "(失败)")
+
+
+_MOUSE_BUTTON_FLAGS = {
+    "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+}
+
+
+def mouse_click(kind: str = "left") -> str:
+    """鼠标点击:left/right/middle/double_left;按下与松开成对提交。"""
+    if kind == "double_left":
+        mouse_click("left")
+        time.sleep(0.05)
+        return mouse_click("left")
+    down_flag, up_flag = _MOUSE_BUTTON_FLAGS[kind]
+    ok = _mouse(down_flag) and _mouse(up_flag)
+    return f"鼠标{kind}单击" + ("" if ok else "(失败)")
+
+
+def mouse_move(direction: str, distance: int = 100) -> str:
+    """指针相对移动(物理像素,DPI 缩放由系统处理):上下左右,1..=2000。"""
+    distance = validate_amount(int(distance), 2000)
+    deltas = {
+        "up": (0, -distance), "down": (0, distance),
+        "left": (-distance, 0), "right": (distance, 0),
+    }
+    dx, dy = deltas[direction]
+    ok = _mouse(MOUSEEVENTF_MOVE, dx=dx, dy=dy)
+    return f"指针{direction} {distance}px" + ("" if ok else "(失败)")
+
+
 def tap_key(name: str):
     vk = name_to_vk(name)
     _tap(vk)
@@ -336,6 +430,12 @@ def perform(action: dict) -> str:
             args=action.get("args"),
             lnk=action.get("lnk"),
         )
+    if t == "scroll":
+        return scroll(action.get("direction", "down"), int(action.get("steps", 1)))
+    if t == "mouse_click":
+        return mouse_click(action.get("kind", "left"))
+    if t == "mouse_move":
+        return mouse_move(action.get("direction", "down"), int(action.get("distance", 100)))
     if t == "focus":
         pattern = action["title_regex"]
         ok = focus_window(pattern)

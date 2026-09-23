@@ -26,6 +26,25 @@ from . import runtime
 GESTURE_SLOTS = ("click", "double_click", "long_press")
 SLOT_LABELS = {"click": "单击", "double_click": "双击", "long_press": "长按"}
 
+# v2.0 按住连发节律表(间隔毫秒,对齐 Mac 原版 HIDRemoteScheduler / SayAll):
+# 返回 50ms、方向/音量± 100ms,其余键不连发(一次性动作语义)。
+# 返回键走 TAP_ 哑键通道无原生形态,照 50ms 计。
+_REPEAT_TABLE: dict[str, int] = {
+    "TAP_BACK": 50,
+    "VK_UP": 100, "VK_DOWN": 100, "VK_LEFT": 100, "VK_RIGHT": 100,
+    "TAP_VOLUME_UP": 100, "TAP_VOLUME_DOWN": 100,
+}
+
+# v2.0 身份映射对冲:透传语义下,各键进 OS 的原生 VK(None=无原生形态,
+# 如哑键/语音键/电源 VK_NONE)。配置"单击=按键 <同值>"时原生已交付,免注入。
+_NATIVE_VK: dict[str, str | None] = {
+    "VK_UP": "VK_UP", "VK_DOWN": "VK_DOWN", "VK_LEFT": "VK_LEFT",
+    "VK_RIGHT": "VK_RIGHT", "VK_RETURN": "VK_RETURN", "VK_HOME": "VK_HOME",
+    "VK_APPS": "VK_APPS", "VK_0xC0": "VK_0xC0",
+    "VK_NONE": None, "VK_F5": None,
+    "TAP_BACK": None, "TAP_VOLUME_UP": None, "TAP_VOLUME_DOWN": None,
+}
+
 
 def key_slots(entry: dict) -> dict:
     """取一个键的三个手势动作槽;缺省槽位为 no-op。"""
@@ -139,6 +158,11 @@ DEFAULT_CONFIG = {
     "wechat_toggle_hotkey": ["VK_CONTROL", "VK_LWIN", "VK_SHIFT"],
     "wechat_ready_delay": 0.45,   # 面板热键后等输入法就绪的秒数（丢了开头可调大）
     "voice_diagnostics": False,   # 调试时覆盖保存最后一段 WAV/ADPCM/指标
+    # ---- v2.0 wechat_rt 实时模式(SayAll 配方) ----
+    # voice_mode="wechat_rt" 时生效:按住式和弦 + 键间间隔注入 + F5 全吞。
+    # WeType 侧需把「按住说话」热键设为 Ctrl+Win(左)。
+    "wechat_rt_hotkey": ["VK_LCONTROL", "VK_LWIN"],
+    "wechat_rt_gap_ms": 80.0,     # 键间间隔;SayAll 实证值(零间隔会被 WeType 拒)
     "keys": {
         "VK_UP": {"label": "↑", "on_down": {"type": "none"}},
         "VK_DOWN": {"label": "↓", "on_down": {"type": "none"}},
@@ -175,6 +199,10 @@ ACTION_TYPES = [
     ("media_next", "媒体 下一首", {}),
     ("media_prev", "媒体 上一首", {}),
     ("open_app", "打开/聚焦应用", {"targets": [], "window": [], "args": []}),
+    # ---- 鼠标动作(v2.0,对齐 SayAll 功能面) ----
+    ("scroll", "滚轮", {"direction": "down", "steps": 1}),
+    ("mouse_click", "鼠标点击", {"kind": "left"}),
+    ("mouse_move", "指针移动", {"direction": "up", "distance": 100}),
 ]
 
 
@@ -213,6 +241,18 @@ def action_summary(action: dict) -> str:
     if t == "open_app":
         targets = "+".join(action.get("targets", [])) or "?"
         return f"打开应用({targets})"
+    if t == "scroll":
+        d = "上" if action.get("direction") == "up" else "下"
+        steps = action.get("steps", 1)
+        return f"滚轮{d}" + (f" {steps} 格" if int(steps) != 1 else "")
+    if t == "mouse_click":
+        return {"left": "鼠标左键", "right": "鼠标右键",
+                "middle": "鼠标中键", "double_left": "鼠标双击"}.get(
+            action.get("kind", "left"), "鼠标点击")
+    if t == "mouse_move":
+        d = {"up": "上", "down": "下", "left": "左", "right": "右"}.get(
+            action.get("direction", "up"), "?")
+        return f"指针{d}移 {action.get('distance', 100)}px"
     return str(t)
 
 
@@ -287,14 +327,26 @@ class MiRemoteService:
         self._record_event(event_name, **fields)
         self._emit_status()
 
+    def _bump_f5_hook(self):
+        """v2.0 wechat_rt:会话开始时把 F5 钩子 bump 回链头(异步,失败静默)。"""
+        hook = getattr(self, "_llhook", None)
+        if hook is not None:
+            try:
+                hook.bump_soon()
+            except Exception:
+                pass
+
     def _start_f5_hook_if_needed(self, eng: RawInputEngine):
         dev = self.config.get("device", {})
-        # LL 钩子只服务 Codex v4 开发版（live 且非 live2）；live2 改用
-        # Gadget 报文级抹除（更彻底：全系统任何通道都看不到 F5，且不受
-        # 钩子链顺序影响——WeType 重装钩子插队也无所谓）。
+        # LL 钩子服务实时系:wechat_rt(v2.0,80ms 间隔注入的按住和弦——F5 必须
+        # 全吞且钩子保持链头,WeType 重装钩子插队会致和弦被拒)与 v4 live;
+        # live2 改用 Gadget 报文级抹除(链序无关)。
         if not (
             dev.get("voice", True)
-            and self.config.get("wechat_live", False)
+            and (
+                self.config.get("voice_mode") == "wechat_rt"
+                or self.config.get("wechat_live", False)
+            )
             and not self.config.get("wechat_live2", False)
             and self._voice is not None
             and self._voice.ready
@@ -394,14 +446,15 @@ class MiRemoteService:
                     self.on_log(f"语音已输入: {text}")
 
                 mode = self.config.get("voice_mode", "local")
+                is_rt = mode == "wechat_rt"
                 voice_kwargs = {
                     "on_text": on_text,
                     "log": lambda m: self.on_log(f"[语音] {m}"),
                     "model": self.config.get("voice_model", "medium"),
                     "mode": mode,
                     "wechat_hotkey": self.config.get("wechat_hotkey"),
-                    "live": self.config.get("wechat_live", True),
-                    "live2": self.config.get("wechat_live2", False),
+                    "live": self.config.get("wechat_live", True) or is_rt,
+                    "live2": self.config.get("wechat_live2", False) and not is_rt,
                     "toggle_hotkey": self.config.get("wechat_toggle_hotkey"),
                     "arm_suppression": lambda: bool(
                         self._tap and self._tap.arm_voice_suppression(2000)
@@ -409,12 +462,19 @@ class MiRemoteService:
                     "ready_delay": self.config.get("wechat_ready_delay", 0.45),
                     "diagnostics": self.config.get("voice_diagnostics", False),
                     "diagnostics_root": app_data_dir() / "diagnostics",
+                    "rt_hotkey": self.config.get("wechat_rt_hotkey"),
+                    "rt_gap_ms": float(self.config.get("wechat_rt_gap_ms", 80)),
                 }
                 voice_kwargs["on_event"] = self._voice_event
                 vd = VoiceDaemon(**voice_kwargs)
+                # v2.0 wechat_rt:每段会话开始把 F5 钩子 bump 回链头(WeType
+                # 重装钩子插队防护),由 VoiceDaemon 在 rt 分支调用。
+                vd.session_start_hook = self._bump_f5_hook
                 self._voice = vd
                 if vd.start():
-                    if mode == "wechat":
+                    if is_rt:
+                        playback_mode = "实时模式 rt(按住和弦+80ms 间隔注入+F5 全吞)"
+                    elif mode == "wechat":
                         if self.config.get("wechat_live2", False):
                             playback_mode = "实时模式 live2：面板预开+切换式，"
                             "按住说话面板实时出字，松手自动提交粘贴"
@@ -578,24 +638,41 @@ class MiRemoteService:
         return self._slot_action(name, trigger).get("type", "none") != "none"
 
     def _slot_repeatable(self, name: str) -> bool:
-        """按住连发许可:tap/音量类自动允许(与键盘按住自动重复一致),
-        配置里 repeat: true/false 可显式强制开或关。"""
+        """按住连发许可:v2.0 起按**节律表**决定(对齐 Mac 原版/SayAll:
+        返回 50ms、方向/音量± 100ms、其余键不连发——OK/Home/Menu/TV/电源是
+        一次性动作语义);配置里 repeat: true/false 显式强制开或关仍优先。"""
         entry = self.config.get("keys", {}).get(name, {})
         rep = entry.get("repeat")
         if rep is not None:
             return bool(rep)
-        return key_slots(entry)["click"].get("type") in ("volume", "tap")
+        return _REPEAT_TABLE.get(name) is not None
 
     def _repeat_timing(self, name: str) -> tuple:
-        """每键连发节律(首延迟秒, 间隔秒);配置 repeat_delay/repeat_interval 毫秒。"""
+        """每键连发节律(首延迟秒, 间隔秒)。
+
+        默认:首延迟统一 350ms;间隔取节律表(返回 50ms/方向音量 100ms),
+        配置 repeat_interval/repeat_delay 毫秒可覆盖。
+        """
         entry = self.config.get("keys", {}).get(name, {})
+        default_interval = _REPEAT_TABLE.get(name, 100)
         delay = float(entry.get("repeat_delay", 350)) / 1000.0
-        interval = float(entry.get("repeat_interval", 100)) / 1000.0
+        interval = float(entry.get("repeat_interval", default_interval)) / 1000.0
         return (delay, interval)
 
     def _fire_gesture(self, name: str, trigger: Trigger) -> None:
         action = self._slot_action(name, trigger)
         if action.get("type", "none") == "none":
+            return
+        # 身份映射对冲(v2.0,SayAll 泄漏对冲思想的移植):本项目是透传语义,
+        # 配置动作与该键原生 VK 相同时,原生动作已经进 OS——再注入就是双响应。
+        # 此时跳过注入,只记录(单击槽、tap 类动作才适用)。
+        if (trigger is Trigger.CLICK
+                and action.get("type") == "tap"
+                and action.get("key") == _NATIVE_VK.get(name)):
+            entry = self.config.get("keys", {}).get(name, {})
+            self.on_log(
+                f"{entry.get('label', name)} -> 身份映射对冲(原生 {action['key']} 已交付,免注入)"
+            )
             return
         entry = self.config.get("keys", {}).get(name, {})
         label = entry.get("label", name)

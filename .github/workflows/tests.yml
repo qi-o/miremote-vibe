@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装测试依赖
+        run: pip install pytest
+      - name: 纯逻辑单测
+        run: python -m pytest tests/ -q
+      - name: 手势/迁移/对冲冒烟
+        run: python tests/smoke_gestures.py
+      - name: 编译全包
+        run: python -m compileall -q miremote

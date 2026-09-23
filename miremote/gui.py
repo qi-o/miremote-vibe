@@ -851,6 +851,7 @@ class MiRemoteWindow(QtWidgets.QMainWindow):
         self.mode_box = QtWidgets.QComboBox()
         self.mode_box.addItem("本地 whisper（离线）", "local")
         self.mode_box.addItem("微信输入法（去语气词）", "wechat")
+        self.mode_box.addItem("微信输入法·实时 rt（v2.0，SayAll 配方）", "wechat_rt")
         idx = self.mode_box.findData(self.service.config.get("voice_mode", "local"))
         self.mode_box.setCurrentIndex(max(0, idx))
         self.mode_box.currentIndexChanged.connect(self._on_mode_change)

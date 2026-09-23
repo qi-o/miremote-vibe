@@ -989,7 +989,10 @@ class VoiceDaemon:
                  arm_suppression=None,
                  diagnostics: bool = False,
                  diagnostics_root: Path | None = None,
-                 on_event=None):
+                 on_event=None,
+                 rt_hotkey: list[str] | None = None,
+                 rt_gap_ms: float = 80.0,
+                 session_start_hook=None):
         self.on_text = on_text      # callable(text: str)
         self.log = log
         self.model = model
@@ -1009,6 +1012,19 @@ class VoiceDaemon:
         self.diagnostics = diagnostics
         self.diagnostics_root = diagnostics_root
         self.on_event = on_event
+        # ---- wechat_rt(v2.0,SayAll 配方复活实时输入) ----
+        # 按住式和弦(默认左 Ctrl+左 Win)+ 键间 80ms 间隔注入 + F5 全吞(链头 bump)。
+        # live/live2 的失败根因(零间隔批量注入被 WeType 拒 + F5 夹在和弦中被拒)
+        # 见 docs/SayAll交叉研究-2026-09.md §一.1。
+        self.rt = mode == "wechat_rt"
+        if self.rt:
+            self.mode = "wechat"    # 复用 wechat 桥接管线
+            self.live = True        # 复用实时送音基建
+            self.live2 = False
+        self.rt_hotkey = rt_hotkey or ["VK_LCONTROL", "VK_LWIN"]
+        self.rt_gap_ms = float(rt_gap_ms)
+        self.session_start_hook = session_start_hook  # callable()：会话开始时
+        # 触发外部动作(如 F5 钩子即时 bump 回链头)
         self.loop: asyncio.AbstractEventLoop | None = None
         self._cmds: asyncio.Queue | None = None
         self._stop_async: asyncio.Event | None = None
@@ -1548,6 +1564,17 @@ class VoiceDaemon:
         self._emit_event("voice.recording", state="recording", session=self._recovery_session)
         # RC003 的 START_SEARCH 响应由 AtvvClient 处理；会话 begin 只负责
         # 建立本地收集边界，绝不能再次主动 MIC_OPEN。
+        if self.rt:
+            # v2.0 wechat_rt：先请外部把 F5 钩子 bump 回链头(WeType 插队防护),
+            # 等待 F5 吞键生效,再按住式和弦(80ms 间隔)注入,然后实时送音。
+            from .telemetry import note as _note
+            _note("voice", "rt_session_begin")
+            if self.session_start_hook is not None:
+                try:
+                    self.session_start_hook()
+                except Exception:
+                    pass
+            self._wait_remote_f5_gate(0.35)
         if self.mode == "wechat" and self.live:
             self._live_armed = await self._prepare_live_session(cli)
             self._live_started.set()
@@ -1792,6 +1819,20 @@ class VoiceDaemon:
             self._live_provider_started = True
             if self._live_request_at <= 0:
                 self._live_request_at = time.monotonic()
+        if self.rt:
+            # v2.0 wechat_rt:按住式和弦,键间 rt_gap_ms 间隔(SayAll 实证配方;
+            # 零间隔批量注入会被 WeType 拒),失败回滚防粘键。
+            from . import actions as _act
+            from .telemetry import note as _note
+            ok = _act.hold_chord_spaced(self.rt_hotkey, self.rt_gap_ms, down=True)
+            _note("voice", "rt_chord", direction="down", gap_ms=self.rt_gap_ms,
+                  result="passed" if ok else "failed")
+            if ok:
+                self.log(f"WeType 按住和弦已注入(间隔 {self.rt_gap_ms:.0f}ms)")
+                return True
+            with self._live_state_lock:
+                self._live_provider_started = False
+            return False
         if self._tap_hotkey(80):
             self.log("WeType toggle 已发送（启动，80ms）")
             return True
@@ -1804,6 +1845,18 @@ class VoiceDaemon:
             if not self._live_provider_started:
                 return False
             self._live_provider_started = False
+        if self.rt:
+            # 松开和弦(反序、同样间隔) -> WeType 识别上屏。
+            from . import actions as _act
+            from .telemetry import note as _note
+            ok = _act.hold_chord_spaced(self.rt_hotkey, self.rt_gap_ms, down=False)
+            _note("voice", "rt_chord", direction="up", reason=reason,
+                  result="passed" if ok else "failed")
+            self.log(
+                f"WeType 按住和弦已释放（reason={reason}）"
+                if ok else f"WeType 和弦释放失败（reason={reason}）"
+            )
+            return ok
         sent = self._tap_hotkey(80)
         self.log(
             f"WeType toggle 已发送（提交，80ms，reason={reason}）"

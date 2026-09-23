@@ -63,6 +63,11 @@ user32.UnhookWindowsHookEx.argtypes = (wt.HHOOK,)
 user32.CallNextHookEx.restype = LRESULT
 user32.CallNextHookEx.argtypes = (wt.HHOOK, ctypes.c_int, wt.WPARAM, wt.LPARAM)
 user32.GetMessageW.restype = ctypes.c_int
+user32.PeekMessageW.restype = wt.BOOL
+user32.PeekMessageW.argtypes = (wt.LPMSG, wt.HWND, wt.UINT, wt.UINT, wt.UINT)
+user32.MsgWaitForMultipleObjects.restype = wt.DWORD
+user32.MsgWaitForMultipleObjects.argtypes = (
+    wt.DWORD, ctypes.c_void_p, wt.BOOL, wt.DWORD, wt.DWORD)
 user32.PostThreadMessageW.restype = wt.BOOL
 user32.PostThreadMessageW.argtypes = (wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM)
 kernel32.GetModuleHandleW.restype = wt.HINSTANCE
@@ -209,6 +214,28 @@ class F5SuppressHook:
                 pass  # 判定异常绝不吞键
         return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
+    # ---- 钩子链头 bump(v2.0,依据 SayAll 2026-09-04:WeType 会重装钩子插队,
+    # 把吞 F5 的钩子压到身后;须周期性"先挂新钩再卸旧钩"回链头) ----
+    BUMP_INTERVAL = 10.0  # 秒;语音会话开始时另有即时 bump
+    WM_BUMP_NOW = 0x8000 + 0x0001  # WM_APP+1
+
+    def bump_soon(self):
+        """请求钩子线程尽快 bump 回链头(语音会话开始时调用);异步。"""
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, self.WM_BUMP_NOW, 0, 0)
+
+    def _bump_hook(self) -> None:
+        """先挂新钩再卸旧钩(消除吞键空窗);失败保持旧钩。"""
+        hinst = kernel32.GetModuleHandleW(None)
+        new_hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._proc_keepalive, hinst, 0)
+        if not new_hook:
+            return
+        old = self._hook
+        self._hook = new_hook
+        if old:
+            user32.UnhookWindowsHookEx(old)
+
     # ---- 生命周期 ----
     def start(self):
         if self._thread is not None:
@@ -228,9 +255,26 @@ class F5SuppressHook:
             self._hook = hook
             ready.set()
             msg = wt.MSG()
-            # -1=错误 0=WM_QUIT：两者都退出并卸载钩子
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                pass
+            # 消息泵 + 10s 周期 bump:MsgWaitForMultipleObjects 超时无消息时
+            # bump 回链头(WeType 重装钩子插队后恢复优先);WM_BUMP_NOW 即时
+            # bump;WM_QUIT 退出并卸钩。
+            QS_ALLINPUT = 0x00FF
+            WAIT_TIMEOUT = 0x102
+            while True:
+                wait = user32.MsgWaitForMultipleObjects(
+                    0, None, False, int(self.BUMP_INTERVAL * 1000), QS_ALLINPUT)
+                got_quit = False
+                # PM_REMOVE=1:先抽干队列里的消息再决定 bump,避免丢事件。
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    if msg.message == WM_QUIT:
+                        got_quit = True
+                        break
+                    if msg.message == self.WM_BUMP_NOW:
+                        self._bump_hook()
+                if got_quit:
+                    break
+                if wait == WAIT_TIMEOUT:
+                    self._bump_hook()
             user32.UnhookWindowsHookEx(self._hook)
             self._hook = None
 
