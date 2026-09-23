@@ -23,36 +23,41 @@ adjust volume.
 | ![控制台](assets/ui-control.png) | ![按键映射](assets/ui-mapping.png) |
 
 > [!IMPORTANT]
-> **项目现状**：这是一个 vibe Coding 项目——在一天之内由 AI agent 与作者
-> 协作完成，代码比较粗糙，不是一个完善的产品。它在我的机器上完整跑通，
-> 但没有经过多设备、多环境的测试。
+> **项目现状**：个人 vibe Coding 项目——由 AI agent 与作者协作,从 2026-08 的
+> 一天原型起,按"真机实证 + 文档先行"的节奏持续迭代(v1.2 tap4 稳定版 →
+> v1.3 三手势键位系统 → **v2.0 SayAll 交叉研究驱动升级**)。代码仍算不上
+> 完善产品;仅在本机(RC003 固件 2671 + RTX 4060)完整验证,未做多设备测试。
 >
-> **发布目的**：发布出来只是希望给大家一个参考，尤其是给 Windows 系统下
-> 想要使用小米蓝牙遥控器硬件做类似事情的人提供参考——这里的设备协议逆向、
-> 蓝牙语音解码、被系统丢弃按键的救回方案，记录了本机验证过的 Windows 实现。
+> **发布目的**:给 Windows 下想让小米蓝牙遥控器干活的开发者一个可改的参考——
+> 设备协议逆向、蓝牙语音解码、被系统驱动丢弃按键的救回(tap4/Frida Gadget)、
+> 以及与同硬件独立实现 SayAll 的交叉研究档案,全部真机验证后成文。
 >
-> **交流意愿**：这是我自己 vibe coding 出来的一个小玩具，分享出来纯粹是
-> 希望它记录的技术方案能帮到遇到同样问题的人。**大概率不会有后期维护**——
-> 如果哪里跑不通，README 的踩坑记录和 `docs/` 里的技术档案写得很细，
-> 建议直接把源码拿去自己改，不必等我。祝玩得开心。
+> **维护方式**:不承诺定期维护,但活跃期会持续吸收同类项目的实证结论
+> (见 `docs/SayAll交叉研究-2026-09.md`);测试(pytest + 冒烟 + GitHub Actions
+> CI)与工程制度(AGENTS.md / Bugs/ / Testing/)已建立,欢迎带着证据链提
+> issue/PR。如果只是想跑通,踩坑记录和 `docs/` 档案足够自诊,直接改源码
+> 也完全没问题。祝玩得开心。
 >
-> **Project status**: This is a vibe-coding project — built in a single day by
-> an AI agent working with its author. The code is rough; it is **not** a
-> polished product. It works end-to-end on my machine but has not been tested
-> across different hardware or environments.
+> **Project status**: A personal vibe-coding project — an AI agent working with
+> its author, evolved from a one-day 2026-08 prototype through steady,
+> evidence-driven iterations (v1.2 tap4 stable → v1.3 three-gesture key system
+> → **v2.0, driven by cross-research with SayAll**). Still not a polished
+> product; verified end-to-end only on the author's machine (RC003 firmware
+> 2671 + RTX 4060).
 >
-> **Why published**: Shared purely as a reference, especially for people on
-> Windows who want to hack on this Xiaomi remote hardware — the protocol
-> reverse engineering, Bluetooth voice decoding, and recovery of keys silently
-> dropped by the Windows driver are documented here with an implementation
-> tested on the author's Windows setup.
+> **Why published**: A hackable reference for anyone driving Xiaomi remotes on
+> Windows — protocol reverse engineering, Bluetooth voice decoding, recovery of
+> driver-dropped keys (tap4 / Frida Gadget), and a cross-research archive with
+> SayAll (an independent implementation on the same hardware), all validated on
+> real hardware before being written down.
 >
-> **Community**: This is a little toy I vibe-coded for myself, shared purely
-> in the hope that the documented solutions help someone hitting the same
-> problems. **It will most likely not be maintained.** If something breaks,
-> the pitfalls log in this README and the archive under `docs/` are quite
-> detailed — feel free to take the source and adapt it yourself rather than
-> waiting on me. Happy hacking.
+> **Maintenance**: No scheduled maintenance, but during active periods the
+> project keeps absorbing evidence-backed findings from sibling projects (see
+> `docs/SayAll交叉研究-2026-09.md`). Tests (pytest + smoke + GitHub Actions
+> CI) and engineering conventions (AGENTS.md / Bugs/ / Testing/) are in place;
+> issues and PRs **with evidence chains** are welcome. If you just want it to
+> work, the pitfalls log and `docs/` archive are detailed enough to self-serve —
+> adapting the source directly is perfectly fine too. Happy hacking.
 
 ---
 
@@ -685,12 +690,29 @@ the complete development story in [docs/开发说明.md](docs/开发说明.md) (
       [docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md](docs/实时输入攻坚复盘-LIVE2_POSTMORTEM.md)**
       (Chinese). Dormant code (`MIREMOTE_REALTIME_DEV`) and diagnostic probes
       are in the repo — new ideas welcome
+- [x] **Press-to-text realtime resurrected (v2.0 `wechat_rt`)**: the SayAll
+      cross-research supplied two evidence-backed facts (WeType rejects
+      zero-gap batched chords; any chord with the leaked F5 wedged inside is
+      rejected whole) that overturn the live2 postmortem's "IME only trusts
+      hardware keys" assumption — 80 ms spaced injection + F5 chain-head bump
+      is the working recipe. **Real-device validation: deferred** (see
+      Testing/手测清单.md); unit tests and the recipe are in place
+- [ ] wechat_rt real-device validation & parameter tuning (gap / panel-ready delay)
 - [ ] Support more remotes (requires usage-table collection via learn mode)
 
 ## Credits & License
 
 ### Referenced projects
 
+- **[GetSayAll/remote-mic-app-windows (SayAll Windows)](https://github.com/GetSayAll/remote-mic-app-windows)** (GPL-3.0)
+  An independent implementation on the same hardware (RC001/RC003, Rust +
+  Tauri 2). Its public Bugs/ root-cause archives and controlled-experiment
+  methodology directly drove this project's v2.0: the WeType realtime recipe
+  (80 ms spaced injection + F5 chain-head bump), two independent confirmations
+  ("physicalize" is a structural no-op; RC003 exposes no RAWHID device), the
+  ConsentStore microphone-observation technique, and the engineering
+  conventions (Bugs/ archives, deferred/passed ledger, AGENTS boundaries).
+  Full cross-research: [docs/SayAll交叉研究-2026-09.md](docs/SayAll交叉研究-2026-09.md).
 - **[richlearntodo-debug/vibe-flow (言灵 Vibe Flow)](https://github.com/richlearntodo-debug/vibe-flow)** (GPL-3.0)
   A same-generation Windows remote vibe-coding tool (C#/.NET) that is more
   complete and actively maintained: continuous dictation (host stream + 8s
