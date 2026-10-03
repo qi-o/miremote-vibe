@@ -327,15 +327,6 @@ class MiRemoteService:
         self._record_event(event_name, **fields)
         self._emit_status()
 
-    def _bump_f5_hook(self):
-        """v2.0 wechat_rt:会话开始时把 F5 钩子 bump 回链头(异步,失败静默)。"""
-        hook = getattr(self, "_llhook", None)
-        if hook is not None:
-            try:
-                hook.bump_soon()
-            except Exception:
-                pass
-
     def _start_f5_hook_if_needed(self, eng: RawInputEngine):
         dev = self.config.get("device", {})
         # LL 钩子服务实时系:wechat_rt(v2.0,80ms 间隔注入的按住和弦——F5 必须
@@ -467,9 +458,7 @@ class MiRemoteService:
                 }
                 voice_kwargs["on_event"] = self._voice_event
                 vd = VoiceDaemon(**voice_kwargs)
-                # v2.0 wechat_rt:每段会话开始把 F5 钩子 bump 回链头(WeType
-                # 重装钩子插队防护),由 VoiceDaemon 在 rt 分支调用。
-                vd.session_start_hook = self._bump_f5_hook
+                # v2.1:session_start_hook 不再需要(链头 bump 已移除,FIFO 证伪)
                 self._voice = vd
                 if vd.start():
                     if is_rt:
