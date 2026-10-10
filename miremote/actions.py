@@ -21,6 +21,23 @@ user32 = ctypes.WinDLL("user32")
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+KEYEVENTF_EXTENDEDKEY = 0x0001
+
+# Windows 对扩展键(Pad 键/右修饰键等)要求 E0 前缀,否则扫描码会被
+# 部分应用(键盘测试网页/Electron)解析到错误的物理键位。
+_EXTENDED_VKS = frozenset(range(0x21, 0x29)) | {  # PgUp..Down(含方向键全部)
+    0x1C,  # Numpad Enter
+    0x1D,  # RCtrl
+    0x35,  # Numpad /
+    0x37,  # PrintScreen
+    0x38,  # RAlt
+    0x46,  # Break
+    0x5B,  # LWin
+    0x5C,  # RWin
+    0x5D,  # Apps
+    0x5F,  # Sleep
+}
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -52,11 +69,33 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wt.DWORD), ("union", _INPUTU)]
 
 
+def _scan_code(vk: int) -> tuple[int, bool]:
+    """VK → (PS/2 Set-1 扫描码, 是否扩展键)。返回 (0, False) 表示无 Set-1 码。
+
+    v2.2(SayAll v0.8.6 #195 实证):SendInput 只填 VK 不填扫描码时,
+    到达系统的事件 wScan=0——按物理键位认键的程序(键盘测试网页/Cherry
+    Studio 等 Electron 应用)完全看不到这些键。补上扫描码后这些应用
+    恢复识别;MapVirtualKeyW(MAPVK_VK_TO_VSC)返回的就是 PS/2 Set-1 值。
+    """
+    scancode = user32.MapVirtualKeyW(vk, 4)  # MAPVK_VK_TO_VSC_EX(含 E0/E1 高字节)
+    if scancode == 0:
+        return 0, False  # 无 Set-1 码(如媒体键),回退 VK-only 注入
+    extended = (scancode >> 8) in (0xE0, 0xE1) or vk in _EXTENDED_VKS
+    return scancode & 0xFF, extended
+
+
 def _tap(vk: int, up: bool = False):
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
     inp.union.ki.wVk = vk
-    inp.union.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
+    scan, extended = _scan_code(vk)
+    flags = KEYEVENTF_KEYUP if up else 0
+    if scan:
+        inp.union.ki.wScan = scan
+        flags |= KEYEVENTF_SCANCODE
+        if extended:
+            flags |= KEYEVENTF_EXTENDEDKEY
+    inp.union.ki.dwFlags = flags
     return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
 
 
